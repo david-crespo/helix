@@ -28,8 +28,8 @@ use helix_view::{
     editor::{
         Action, AutoSave, BufferLine, ClippingConfiguration, ConfigEvent, CursorShapeConfig,
         FilePickerConfig, GutterConfig, IndentGuidesConfig, LineEndingConfig, LineNumber,
-        SearchConfig, SmartTabConfig, StatusLineElement, TerminalConfig, WhitespaceConfig,
-        WhitespaceRender, WhitespaceRenderValue,
+        OptionToml, SearchConfig, SmartTabConfig, StatusLineElement, TerminalConfig,
+        WhitespaceConfig, WhitespaceRender, WhitespaceRenderValue,
     },
     events::{
         DocumentDidChange, DocumentDidClose, DocumentDidOpen, DocumentFocusLost, DocumentSaved,
@@ -3108,11 +3108,15 @@ impl HelixConfiguration {
         self.store_config(app_config);
     }
 
-    fn search(&self, smart_case: bool, wrap_around: bool) {
+    fn search(&self, smart_case: bool, wrap_around: bool, max_matches: Option<usize>) {
         let mut app_config = self.load_config();
         app_config.editor.search = SearchConfig {
             smart_case,
             wrap_around,
+            max_matches: match max_matches {
+                Some(m) => OptionToml::Some(m),
+                None => OptionToml::None,
+            },
         };
         self.store_config(app_config);
     }

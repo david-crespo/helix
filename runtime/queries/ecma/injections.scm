@@ -8,7 +8,7 @@
       property: (property_identifier) @injection.language)
   ]
   arguments: (template_string (string_fragment) @injection.content)
-  (#any-of? @injection.language "html" "css" "json" "sql" "js" "ts" "bash"))
+  (#any-of? @injection.language "html" "css" "json" "sql" "js" "ts" "bash" "md"))
 
 ; Parse the contents of $ template literals as shell commands
 

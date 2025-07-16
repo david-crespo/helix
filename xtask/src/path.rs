@@ -23,6 +23,13 @@ pub fn themes() -> PathBuf {
     runtime().join("themes")
 }
 
-pub fn lang_config() -> PathBuf {
-    project_root().join("languages.toml")
+pub fn tests_indent() -> PathBuf {
+    project_root().join("tests").join("indent")
+}
+
+pub fn tests_highlight() -> PathBuf {
+    project_root()
+        .join("tests")
+        .join("query")
+        .join("highlights")
 }

@@ -13,6 +13,7 @@ pub type SyncCallback = Box<dyn FnOnce(&mut Compositor, &mut Context) + Sync>;
 pub enum EventResult {
     Ignored(Option<Callback>),
     Consumed(Option<Callback>),
+    ConsumedWithoutRerender,
 }
 
 use crate::job::Jobs;
@@ -73,6 +74,10 @@ pub trait Component: Any + AnyComponent {
     fn id(&self) -> Option<&'static str> {
         None
     }
+
+    fn name(&self) -> Option<&str> {
+        self.id()
+    }
 }
 
 pub struct Compositor {
@@ -132,8 +137,22 @@ impl Compositor {
         let idx = self
             .layers
             .iter()
-            .position(|layer| layer.id() == Some(id))?;
+            .rposition(|layer| layer.id() == Some(id))?;
         Some(self.layers.remove(idx))
+    }
+
+    pub fn remove_by_dynamic_name(&mut self, id: &str) -> Option<Box<dyn Component>> {
+        let idx = self
+            .layers
+            .iter()
+            .rposition(|layer| layer.name() == Some(id))?;
+        Some(self.layers.remove(idx))
+    }
+
+    pub fn remove_type<T: 'static>(&mut self) {
+        let type_name = std::any::type_name::<T>();
+        self.layers
+            .retain(|component| component.type_name() != type_name);
     }
 
     pub fn handle_event(&mut self, event: &Event, cx: &mut Context) -> bool {
@@ -162,6 +181,10 @@ impl Compositor {
                     consumed = true;
                     break;
                 }
+                // Swallow the event, but don't trigger a re-render
+                EventResult::ConsumedWithoutRerender => {
+                    break;
+                }
                 EventResult::Ignored(Some(callback)) => {
                     callbacks.push(callback);
                 }
@@ -178,7 +201,9 @@ impl Compositor {
 
     pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         for layer in &mut self.layers {
-            layer.render(area, surface, cx);
+            if layer.should_update() {
+                layer.render(area, surface, cx)
+            };
         }
     }
 
@@ -214,6 +239,10 @@ impl Compositor {
 
     pub fn need_full_redraw(&mut self) {
         self.full_redraw = true;
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
     }
 }
 

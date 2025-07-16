@@ -13,7 +13,7 @@ pub trait Item: Sync + Send + 'static {
     /// Additional editor state that is used for label calculation.
     type Data: Sync + Send + 'static;
 
-    fn format(&self, data: &Self::Data) -> Row;
+    fn format(&self, data: &Self::Data) -> Row<'_>;
 }
 
 pub type MenuCallback<T> = Box<dyn Fn(&mut Editor, Option<&T>, MenuEvent)>;
@@ -35,6 +35,8 @@ pub struct Menu<T: Item> {
     size: (u16, u16),
     viewport: (u16, u16),
     recalculate: bool,
+    auto_close: bool,
+    layer_id: Option<&'static str>,
 }
 
 impl<T: Item> Menu<T> {
@@ -59,7 +61,18 @@ impl<T: Item> Menu<T> {
             size: (0, 0),
             viewport: (0, 0),
             recalculate: true,
+            auto_close: false,
+            layer_id: None,
         }
+    }
+
+    pub fn with_layer_id(mut self, layer_id: &'static str) -> Self {
+        self.set_layer_id(layer_id);
+        self
+    }
+
+    pub fn set_layer_id(&mut self, layer_id: &'static str) {
+        self.layer_id = Some(layer_id);
     }
 
     pub fn reset_cursor(&mut self) {
@@ -102,11 +115,34 @@ impl<T: Item> Menu<T> {
         self.adjust_scroll();
     }
 
+    pub fn move_half_page_up(&mut self) {
+        let len = self.matches.len();
+        let max_index = len.saturating_sub((self.size.1 as usize / 2).max(1));
+        let pos = self.cursor.map_or(max_index, |i| (i + max_index) % len) % len;
+        self.cursor = Some(pos);
+        self.adjust_scroll();
+    }
+
     pub fn move_down(&mut self) {
         let len = self.matches.len();
         let pos = self.cursor.map_or(0, |i| i + 1) % len;
         self.cursor = Some(pos);
         self.adjust_scroll();
+    }
+
+    pub fn move_half_page_down(&mut self) {
+        let len = self.matches.len();
+        let pos = self
+            .cursor
+            .map_or(0, |i| i + (self.size.1 as usize / 2).max(1))
+            % len;
+        self.cursor = Some(pos);
+        self.adjust_scroll();
+    }
+
+    pub fn auto_close(mut self, auto_close: bool) -> Self {
+        self.auto_close = auto_close;
+        self
     }
 
     fn recalculate_size(&mut self, viewport: (u16, u16)) {
@@ -210,12 +246,24 @@ impl<T: Item + 'static> Component for Menu<T> {
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let event = match event {
             Event::Key(event) => *event,
+            // Menu is a modal and should consume mouse events so clicks don't fall
+            // through to the editor underneath
+            Event::Mouse(_) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
 
-        let close_fn: Option<Callback> = Some(Box::new(|compositor: &mut Compositor, _| {
+        let layer_id = self.layer_id;
+
+        let close_fn: Option<Callback> = Some(Box::new(move |compositor: &mut Compositor, _| {
             // remove the layer
-            compositor.pop();
+            match layer_id {
+                Some(id) => {
+                    compositor.remove(id);
+                }
+                None => {
+                    compositor.pop();
+                }
+            }
         }));
 
         // Ignore tab key when supertab is turned on in order not to interfere
@@ -251,6 +299,18 @@ impl<T: Item + 'static> Component for Menu<T> {
                 (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
                 return EventResult::Consumed(None);
             }
+            key!(PageUp) | ctrl!('u') => {
+                // page up moves back in the completion choice (including updating the doc)
+                self.move_half_page_up();
+                (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
+                return EventResult::Consumed(None);
+            }
+            key!(PageDown) | ctrl!('d') => {
+                // page down advances completion choice (including updating the doc)
+                self.move_half_page_down();
+                (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
+                return EventResult::Consumed(None);
+            }
             key!(Enter) => {
                 if let Some(selection) = self.selection() {
                     (self.callback_fn)(cx.editor, Some(selection), MenuEvent::Validate);
@@ -272,6 +332,10 @@ impl<T: Item + 'static> Component for Menu<T> {
             // enter confirms the match and closes the menu
             // typing filters the menu
             // if we run out of options the menu closes itself
+            _ if self.auto_close => {
+                (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Abort);
+                return EventResult::Ignored(close_fn);
+            }
             _ => (),
         }
         // for some events, we want to process them but send ignore, specifically all input except

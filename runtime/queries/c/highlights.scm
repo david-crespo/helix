@@ -1,10 +1,16 @@
-
 (identifier) @variable
 
 ((identifier) @constant
   (#match? @constant "^[A-Z][A-Z\\d_]*$"))
 
-"sizeof" @keyword
+[
+  "sizeof"
+  "offsetof"
+  "alignof"
+  "_Alignof"
+  "asm"
+  "__asm__"
+] @keyword
 
 [
   "enum"
@@ -14,8 +20,6 @@
 ] @keyword.storage.type
 
 [
-  "extern"
-  "register"
   (type_qualifier)
   (storage_class_specifier)
 ] @keyword.storage.modifier
@@ -51,12 +55,17 @@
   "#if"
   "#ifdef"
   "#ifndef"
+  "#elifdef"
+  "#elifndef"
   "#include"
   (preproc_directive)
 ] @keyword.directive
 
-(pointer_declarator "*" @type.builtin)
-(abstract_pointer_declarator "*" @type.builtin)
+"..." @punctuation
+
+["," "." ":" "::" ";" "->"] @punctuation.delimiter
+
+["(" ")" "[" "]" "{" "}" "[[" "]]"] @punctuation.bracket
 
 [
   "+"
@@ -95,22 +104,23 @@
   "?"
 ] @operator
 
-(conditional_expression ":" @operator)
+(conditional_expression ":" @operator) ; After punctuation
 
-"..." @punctuation
+(pointer_declarator "*" @type.builtin) ; After Operators
+(abstract_pointer_declarator "*" @type.builtin)
 
-["," "." ":" ";" "->" "::"] @punctuation.delimiter
-
-["(" ")" "[" "]" "{" "}"] @punctuation.bracket
 
 [(true) (false)] @constant.builtin.boolean
 
-(enumerator name: (identifier) @type.enum.variant)
+; C enumerators are integer constants; colour the definition the same as a use
+; site (a SCREAMING_SNAKE reference resolves to @constant above), not as a
+; distinct enum variant. C++ overrides this to keep @type.enum.variant.
+(enumerator name: (identifier) @constant)
 
 (string_literal) @string
 (system_lib_string) @string
 
-(null) @constant
+(null) @constant.builtin
 (number_literal) @constant.numeric
 (char_literal) @constant.character
 (escape_sequence) @constant.character.escape
@@ -121,6 +131,10 @@
 (primitive_type) @type.builtin
 (sized_type_specifier) @type.builtin
 
+; `typedef ... Name;` — the introduced name
+(type_definition
+  declarator: (type_identifier) @type.definition)
+
 (call_expression
   function: (identifier) @function)
 (call_expression
@@ -129,15 +143,67 @@
 (call_expression (argument_list (identifier) @variable))
 (function_declarator
   declarator: [(identifier) (field_identifier)] @function)
+
+; GCC builtins, e.g. __builtin_expect
+((call_expression
+  function: (identifier) @function.builtin)
+ (#match? @function.builtin "^__builtin_"))
+
+; Up to 6 layers of declarators
 (parameter_declaration
   declarator: (identifier) @variable.parameter)
 (parameter_declaration
-  (pointer_declarator
-    declarator: (identifier) @variable.parameter))
+  (_
+    (identifier) @variable.parameter))
+(parameter_declaration
+  (_
+    (_
+      (identifier) @variable.parameter)))
+(parameter_declaration
+  (_
+    (_
+      (_
+        (identifier) @variable.parameter))))
+(parameter_declaration
+  (_
+    (_
+      (_
+        (_
+          (identifier) @variable.parameter)))))
+(parameter_declaration
+  (_
+    (_
+      (_
+        (_
+          (_
+            (identifier) @variable.parameter))))))
+
 (preproc_function_def
   name: (identifier) @function.special)
 
 (attribute
   name: (identifier) @attribute)
+
+; GNU / MSVC attributes and calling conventions
+[
+  "__attribute__"
+  "__declspec"
+  "__based"
+  "__cdecl"
+  "__clrcall"
+  "__stdcall"
+  "__fastcall"
+  "__thiscall"
+  "__vectorcall"
+] @attribute
+
+; Builtin/predefined constants and macros.
+((identifier) @constant.builtin
+ (#any-of? @constant.builtin
+   "stderr" "stdin" "stdout"
+   "__FILE__" "__LINE__" "__DATE__" "__TIME__" "__func__"
+   "__FUNCTION__" "__PRETTY_FUNCTION__" "__BASE_FILE__"
+   "__STDC__" "__STDC_VERSION__" "__STDC_HOSTED__"
+   "__VA_ARGS__" "__VA_OPT__" "__cplusplus"))
 
 (comment) @comment

@@ -1,7 +1,7 @@
 use crate::{
-    commands::{self, OnKeyCallback, OnKeyCallbackKind},
+    commands::{self, engine::ScriptingEngine, OnKeyCallback, OnKeyCallbackKind},
     compositor::{Component, Context, Event, EventResult},
-    events::{OnModeSwitch, PostCommand},
+    events::{OnModeSwitch, PostCommand, TerminalFocusGained, TerminalFocusLost},
     handlers::completion::CompletionItem,
     key,
     keymap::{KeymapResult, Keymaps},
@@ -29,7 +29,7 @@ use helix_view::{
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, Editor, Theme, View,
+    Document, DocumentId, Editor, Theme, View, ViewId,
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
@@ -76,142 +76,174 @@ impl EditorView {
 
     pub fn render_view(
         &self,
-        editor: &Editor,
-        doc: &Document,
-        view: &View,
+        doc_id: DocumentId,
+        view_id: ViewId,
         viewport: Rect,
         surface: &mut Surface,
         is_focused: bool,
+        cx: &mut Context,
     ) {
-        let inner = view.inner_area(doc);
-        let area = view.area;
-        let theme = &editor.theme;
-        let config = editor.config();
-        let loader = editor.syn_loader.load();
+        let doc = cx.editor.document(doc_id).unwrap();
+        let view = cx.editor.tree.get(view_id);
+        {
+            let editor = &cx.editor;
 
-        let view_offset = doc.view_offset(view.id);
+            let inner = view.inner_area(doc);
+            let area = view.area;
+            let theme = &editor.theme;
+            let config = editor.config();
+            let loader = editor.syn_loader.load();
 
-        let text_annotations = view.text_annotations(doc, Some(theme));
-        let mut decorations = DecorationManager::default();
+            let view_offset = doc.view_offset(view.id);
 
-        if is_focused && config.cursorline {
-            decorations.add_decoration(Self::cursorline(doc, view, theme));
-        }
+            let text_annotations = view.text_annotations(doc, Some(theme));
+            let mut decorations = DecorationManager::default();
 
-        if is_focused && config.cursorcolumn {
-            Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
-        }
-
-        // Set DAP highlights, if needed.
-        if let Some(frame) = editor.current_stack_frame() {
-            let dap_line = frame.line.saturating_sub(1);
-            let style = theme.get("ui.highlight.frameline");
-            let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
-                if pos.doc_line != dap_line {
-                    return;
-                }
-                renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
-            };
-
-            decorations.add_decoration(line_decoration);
-        }
-
-        let syntax_highlighter =
-            Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
-        let mut overlays = Vec::new();
-
-        overlays.push(Self::overlay_syntax_highlights(
-            doc,
-            view_offset.anchor,
-            inner.height,
-            &text_annotations,
-        ));
-
-        Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
-
-        if is_focused {
-            if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
-                overlays.push(tabstops);
+            if is_focused && config.cursorline {
+                decorations.add_decoration(Self::cursorline(doc, view, theme));
             }
-            overlays.push(Self::doc_selection_highlights(
-                editor.mode(),
+
+            if is_focused && config.cursorcolumn {
+                Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
+            }
+
+            // Set DAP highlights, if needed.
+            if let Some(frame) = editor.current_stack_frame() {
+                let dap_line = frame.line.saturating_sub(1);
+                let style = theme.get("ui.highlight.frameline");
+                let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
+                    if pos.doc_line != dap_line {
+                        return;
+                    }
+                    renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
+                };
+
+                decorations.add_decoration(line_decoration);
+            }
+
+            let syntax_highlighter =
+                Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+            let mut overlays = Vec::new();
+
+            overlays.push(Self::overlay_syntax_highlights(
                 doc,
-                view,
-                theme,
-                &config.cursor_shape,
-                self.terminal_focused,
+                view_offset.anchor,
+                inner.height,
+                &text_annotations,
             ));
-            if let Some(overlay) = Self::highlight_focused_view_elements(view, doc, theme) {
+
+            if doc
+                .language_config()
+                .and_then(|config| config.rainbow_brackets)
+                .unwrap_or(config.rainbow_brackets)
+            {
+                if let Some(overlay) = Self::doc_rainbow_highlights(
+                    doc,
+                    view_offset.anchor,
+                    inner.height,
+                    theme,
+                    &loader,
+                ) {
+                    overlays.push(overlay);
+                }
+            }
+
+            if let Some(overlay) = Self::doc_document_link_highlights(doc, theme) {
                 overlays.push(overlay);
             }
-        }
 
-        let gutter_overflow = view.gutter_offset(doc) == 0;
-        if !gutter_overflow {
-            Self::render_gutter(
-                editor,
-                doc,
-                view,
-                view.area,
-                theme,
-                is_focused & self.terminal_focused,
-                &mut decorations,
-            );
-        }
+            Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
 
-        Self::render_rulers(editor, doc, view, inner, surface, theme);
-
-        let primary_cursor = doc
-            .selection(view.id)
-            .primary()
-            .cursor(doc.text().slice(..));
-        if is_focused {
-            decorations.add_decoration(text_decorations::Cursor {
-                cache: &editor.cursor_cache,
-                primary_cursor,
-            });
-        }
-        let width = view.inner_width(doc);
-        let config = doc.config.load();
-        let enable_cursor_line = view
-            .diagnostics_handler
-            .show_cursorline_diagnostics(doc, view.id);
-        let inline_diagnostic_config = config.inline_diagnostics.prepare(width, enable_cursor_line);
-        decorations.add_decoration(InlineDiagnostics::new(
-            doc,
-            theme,
-            primary_cursor,
-            inline_diagnostic_config,
-            config.end_of_line_diagnostics,
-        ));
-        render_document(
-            surface,
-            inner,
-            doc,
-            view_offset,
-            &text_annotations,
-            syntax_highlighter,
-            overlays,
-            theme,
-            decorations,
-        );
-
-        // if we're not at the edge of the screen, draw a right border
-        if viewport.right() != view.area.right() {
-            let x = area.right();
-            let border_style = theme.get("ui.window");
-            for y in area.top()..area.bottom() {
-                surface[(x, y)]
-                    .set_symbol(tui::symbols::line::VERTICAL)
-                    //.set_symbol(" ")
-                    .set_style(border_style);
+            if is_focused {
+                if config.lsp.auto_document_highlight {
+                    if let Some(overlay) = Self::doc_document_highlights(doc, view, theme) {
+                        overlays.push(overlay);
+                    }
+                }
+                if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
+                    overlays.push(tabstops);
+                }
+                overlays.push(Self::doc_selection_highlights(
+                    editor.mode(),
+                    doc,
+                    view,
+                    theme,
+                    &config.cursor_shape,
+                    self.terminal_focused,
+                ));
+                if let Some(overlay) = Self::highlight_focused_view_elements(view, doc, theme) {
+                    overlays.push(overlay);
+                }
             }
-        }
 
-        if config.inline_diagnostics.disabled()
-            && config.end_of_line_diagnostics == DiagnosticFilter::Disable
-        {
-            Self::render_diagnostics(doc, view, inner, surface, theme);
+            let gutter_overflow = view.gutter_offset(doc) == 0;
+            if !gutter_overflow {
+                Self::render_gutter(
+                    editor,
+                    doc,
+                    view,
+                    view.area,
+                    theme,
+                    is_focused & self.terminal_focused,
+                    &mut decorations,
+                );
+            }
+
+            Self::render_rulers(editor, doc, view, inner, surface, theme);
+
+            let primary_cursor = doc
+                .selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..));
+            if is_focused {
+                decorations.add_decoration(text_decorations::Cursor {
+                    cache: &editor.cursor_cache,
+                    primary_cursor,
+                });
+            }
+            let width = view.inner_width(doc);
+            let config = doc.config.load();
+            let enable_cursor_line = view
+                .diagnostics_handler
+                .show_cursorline_diagnostics(doc, view.id);
+            let inline_diagnostic_config =
+                config.inline_diagnostics.prepare(width, enable_cursor_line);
+            decorations.add_decoration(InlineDiagnostics::new(
+                doc,
+                theme,
+                primary_cursor,
+                inline_diagnostic_config,
+                config.end_of_line_diagnostics,
+            ));
+            render_document(
+                surface,
+                inner,
+                doc,
+                view_offset,
+                &text_annotations,
+                syntax_highlighter,
+                overlays,
+                theme,
+                decorations,
+            );
+
+            // if we're not at the edge of the screen, draw a right border
+            if viewport.right() != view.area.right() {
+                let x = area.right();
+                let border_style = theme.get("ui.window");
+                for y in area.top()..area.bottom() {
+                    surface[(x, y)]
+                        .set_symbol(tui::symbols::line::VERTICAL)
+                        //.set_symbol(" ")
+                        .set_style(border_style);
+                }
+            }
+
+            if config.inline_diagnostics.disabled()
+                && config.end_of_line_diagnostics == DiagnosticFilter::Disable
+            {
+                Self::render_diagnostics(doc, view, inner, surface, theme);
+            }
         }
 
         let statusline_area = view
@@ -219,8 +251,14 @@ impl EditorView {
             .clip_top(view.area.height.saturating_sub(1))
             .clip_bottom(1); // -1 from bottom to remove commandline
 
-        let mut context =
-            statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
+        let mut context = statusline::RenderContext::new(
+            cx.editor,
+            cx.jobs,
+            view_id,
+            doc_id,
+            is_focused,
+            &self.spinners,
+        );
 
         statusline::render(&mut context, statusline_area, surface);
     }
@@ -304,12 +342,38 @@ impl EditorView {
         text_annotations.collect_overlay_highlights(range)
     }
 
+    pub fn doc_rainbow_highlights(
+        doc: &Document,
+        anchor: usize,
+        height: u16,
+        theme: &Theme,
+        loader: &syntax::Loader,
+    ) -> Option<OverlayHighlights> {
+        let syntax = doc.syntax()?;
+        let text = doc.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let visible_range = Self::viewport_byte_range(text, row, height);
+        let start = syntax::child_for_byte_range(
+            &syntax.tree().root_node(),
+            visible_range.start as u32..visible_range.end as u32,
+        )
+        .map_or(visible_range.start as u32, |node| node.start_byte());
+        let range = start..visible_range.end as u32;
+
+        Some(syntax.rainbow_highlights(text, theme.rainbow_length(), loader, range))
+    }
+
     /// Get highlight spans for document diagnostics
     pub fn doc_diagnostics_highlights_into(
         doc: &Document,
         theme: &Theme,
         overlay_highlights: &mut Vec<OverlayHighlights>,
     ) {
+        // Skip redundant work if no diagnostics.
+        if doc.diagnostics().is_empty() {
+            return;
+        }
+
         use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
         let get_scope_of = |scope| {
             theme
@@ -426,6 +490,60 @@ impl EditorView {
         ]);
     }
 
+    pub fn doc_document_highlights(
+        doc: &Document,
+        view: &View,
+        theme: &Theme,
+    ) -> Option<OverlayHighlights> {
+        let ranges = doc.document_highlights(view.id)?;
+        if ranges.is_empty() {
+            return None;
+        }
+
+        let highlight = theme
+            .find_highlight_exact("ui.highlight")
+            .or_else(|| theme.find_highlight_exact("ui.selection"))
+            .or_else(|| theme.find_highlight_exact("ui.cursor"))?;
+
+        Some(OverlayHighlights::Homogeneous {
+            highlight,
+            ranges: ranges.to_vec(),
+        })
+    }
+
+    pub fn doc_document_link_highlights(
+        doc: &Document,
+        theme: &Theme,
+    ) -> Option<OverlayHighlights> {
+        let highlight = theme
+            .find_highlight_exact("markup.link.url")
+            .or_else(|| theme.find_highlight_exact("markup.link"))?;
+
+        if doc.document_links.is_empty() {
+            return None;
+        }
+
+        let mut ranges: Vec<ops::Range<usize>> = Vec::new();
+        for link in &doc.document_links {
+            if link.start >= link.end {
+                continue;
+            }
+
+            match ranges.last_mut() {
+                Some(existing_range) if link.start <= existing_range.end => {
+                    existing_range.end = existing_range.end.max(link.end);
+                }
+                _ => ranges.push(link.start..link.end),
+            }
+        }
+
+        if ranges.is_empty() {
+            return None;
+        }
+
+        Some(OverlayHighlights::Homogeneous { highlight, ranges })
+    }
+
     /// Get highlight spans for selections in a document view.
     pub fn doc_selection_highlights(
         mode: Mode,
@@ -505,7 +623,7 @@ impl EditorView {
                     };
                 spans.push((selection_scope, range.anchor..selection_end));
                 // add block cursors
-                // skip primary cursor if terminal is unfocused - crossterm cursor is used in that case
+                // skip primary cursor if terminal is unfocused - terminal cursor is used in that case
                 if !selection_is_primary || (cursor_is_block && is_terminal_focused) {
                     spans.push((cursor_scope, cursor_start..range.head));
                 }
@@ -513,7 +631,7 @@ impl EditorView {
                 // Reverse case.
                 let cursor_end = next_grapheme_boundary(text, range.head);
                 // add block cursors
-                // skip primary cursor if terminal is unfocused - crossterm cursor is used in that case
+                // skip primary cursor if terminal is unfocused - terminal cursor is used in that case
                 if !selection_is_primary || (cursor_is_block && is_terminal_focused) {
                     spans.push((cursor_scope, range.head..cursor_end));
                 }
@@ -602,7 +720,7 @@ impl EditorView {
             let rem_width = surface.area.width.saturating_sub(used_width);
 
             x = surface
-                .set_stringn(x, viewport.y, text, rem_width as usize, style)
+                .set_stringn(x, viewport.y, &text, rem_width as usize, style)
                 .0;
 
             if x >= surface.area.right() {
@@ -837,7 +955,11 @@ impl EditorView {
     ) -> Option<KeymapResult> {
         let mut last_mode = mode;
         self.pseudo_pending.extend(self.keymaps.pending());
-        let key_result = self.keymaps.get(mode, event);
+
+        // Check the engine for any buffer specific keybindings first
+        let key_result = ScriptingEngine::handle_keymap_event(self, mode, cxt, event)
+            .unwrap_or_else(|| self.keymaps.get(mode, event));
+
         cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
 
         let mut execute_command = |command: &commands::MappableCommand| {
@@ -1063,6 +1185,20 @@ impl EditorView {
     }
 }
 
+/// Whether the focused doc's workspace is in restricted mode and running `trust` would
+/// change something visible at the workspace level.
+fn workspace_trust_indicator_visible(editor: &Editor) -> bool {
+    if editor.workspace_trust.implicit_level()
+        == helix_loader::workspace_trust::ImplicitTrustLevel::Insecure
+    {
+        return false;
+    }
+    let (_, doc) = helix_view::current_ref!(editor);
+    editor
+        .workspace_trust
+        .workspace_restricted(doc.workspace_root())
+}
+
 impl EditorView {
     /// must be called whenever the editor processed input that
     /// is not a `KeyEvent`. In these cases any pending keys/on next
@@ -1126,6 +1262,8 @@ impl EditorView {
                 let editor = &mut cxt.editor;
 
                 if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
+                    editor.focus(view_id);
+
                     let prev_view_id = view!(editor).id;
                     let doc = doc_mut!(editor, &view!(editor, view_id).doc);
 
@@ -1149,7 +1287,6 @@ impl EditorView {
                         self.clear_completion(editor);
                     }
 
-                    editor.focus(view_id);
                     editor.ensure_cursor_in_view(view_id);
 
                     return EventResult::Consumed(None);
@@ -1160,9 +1297,8 @@ impl EditorView {
 
                     let (view, doc) = current!(cxt.editor);
 
-                    let path = match doc.path() {
-                        Some(path) => path.clone(),
-                        None => return EventResult::Ignored(None),
+                    let Some(path) = doc.path().map(ToOwned::to_owned) else {
+                        return EventResult::Ignored(None);
                     };
 
                     if let Some(char_idx) =
@@ -1238,8 +1374,10 @@ impl EditorView {
                 };
 
                 if should_yank {
-                    commands::MappableCommand::yank_main_selection_to_primary_clipboard
-                        .execute(cxt);
+                    commands::yank_main_selection_to_register(
+                        cxt.editor,
+                        config.mouse_yank_register,
+                    );
                     EventResult::Consumed(None)
                 } else {
                     EventResult::Ignored(None)
@@ -1279,8 +1417,11 @@ impl EditorView {
                 }
 
                 if modifiers == KeyModifiers::ALT {
-                    commands::MappableCommand::replace_selections_with_primary_clipboard
-                        .execute(cxt);
+                    commands::replace_selections_with_register(
+                        cxt.editor,
+                        config.mouse_yank_register,
+                        cxt.count(),
+                    );
 
                     return EventResult::Consumed(None);
                 }
@@ -1289,7 +1430,13 @@ impl EditorView {
                     let doc = doc_mut!(editor, &view!(editor, view_id).doc);
                     doc.set_selection(view_id, Selection::point(pos));
                     cxt.editor.focus(view_id);
-                    commands::MappableCommand::paste_primary_clipboard_before.execute(cxt);
+
+                    commands::paste(
+                        cxt.editor,
+                        config.mouse_yank_register,
+                        commands::Paste::Before,
+                        cxt.count(),
+                    );
 
                     return EventResult::Consumed(None);
                 }
@@ -1468,15 +1615,18 @@ impl Component for EditorView {
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
+                helix_event::dispatch(TerminalFocusGained { cx: &mut cx });
                 self.terminal_focused = true;
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {
+                helix_event::dispatch(TerminalFocusLost { cx: &mut cx });
                 if context.editor.config().auto_save.focus_lost {
                     let options = commands::WriteAllOptions {
                         force: false,
                         write_scratch: false,
                         auto_format: false,
+                        code_actions: false,
                     };
                     if let Err(e) = commands::typed::write_all_impl(context, options) {
                         context.editor.set_error(format!("{}", e));
@@ -1501,6 +1651,22 @@ impl Component for EditorView {
             _ => false,
         };
 
+        let mut area = area;
+
+        // TODO: This may need to get looked at!
+        if let Some(top) = cx.editor.editor_clipping.top {
+            area = area.clip_top(top);
+        }
+        if let Some(bottom) = cx.editor.editor_clipping.bottom {
+            area = area.clip_bottom(bottom);
+        }
+        if let Some(left) = cx.editor.editor_clipping.left {
+            area = area.clip_left(left);
+        }
+        if let Some(right) = cx.editor.editor_clipping.right {
+            area = area.clip_right(right);
+        }
+
         // -1 for commandline and -1 for bufferline
         let mut editor_area = area.clip_bottom(1);
         if use_bufferline {
@@ -1514,9 +1680,22 @@ impl Component for EditorView {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
         }
 
-        for (view, is_focused) in cx.editor.tree.views() {
-            let doc = cx.editor.document(view.doc).unwrap();
-            self.render_view(cx.editor, doc, view, area, surface, is_focused);
+        let views: Vec<(ViewId, bool)> = {
+            cx.editor
+                .tree
+                .views()
+                .map(|(view, is_focused)| (view.id, is_focused))
+                .collect()
+        };
+        for (view_id, is_focused) in views {
+            self.render_view(
+                cx.editor.tree.get(view_id).doc,
+                view_id,
+                area,
+                surface,
+                is_focused,
+                cx,
+            );
         }
 
         if config.auto_info {
@@ -1564,13 +1743,30 @@ impl Component for EditorView {
             } else {
                 0
             };
+            let restricted = workspace_trust_indicator_visible(cx.editor);
+            let trust_width = if restricted { 3 } else { 0 };
             surface.set_string(
-                area.x + area.width.saturating_sub(key_width + macro_width),
+                area.x
+                    + area
+                        .width
+                        .saturating_sub(key_width + macro_width + trust_width),
                 area.y + area.height.saturating_sub(1),
                 disp.get(disp.len().saturating_sub(key_width as usize)..)
                     .unwrap_or(&disp),
                 style,
             );
+            if restricted {
+                let style = style
+                    .fg(helix_view::graphics::Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                surface.set_string(
+                    area.x
+                        .saturating_add(area.width.saturating_sub(3 + macro_width)),
+                    area.y + area.height.saturating_sub(1),
+                    "[⚠]",
+                    style,
+                );
+            }
             if let Some((reg, _)) = cx.editor.macro_recording {
                 let disp = format!("[{}]", reg);
                 let style = style
@@ -1597,7 +1793,7 @@ impl Component for EditorView {
                 if self.terminal_focused {
                     (pos, CursorKind::Hidden)
                 } else {
-                    // use crossterm cursor when terminal loses focus
+                    // use terminal cursor when terminal loses focus
                     (pos, CursorKind::Underline)
                 }
             }

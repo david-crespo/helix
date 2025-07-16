@@ -79,22 +79,32 @@
 (property_signature "?" @punctuation.special)
 
 (conditional_type ["?" ":"] @operator)
+(ternary_expression ["?" ":"] @operator)
 
 ; Keywords
 ; --------
 
 [
   "abstract"
+  "accessor"
   "declare"
   "module"
-  "export"
   "infer"
   "implements"
   "keyof"
   "namespace"
   "override"
   "satisfies"
+  "using"
 ] @keyword
+
+; `asserts` in a return-type type predicate, e.g. `function f(x): asserts x is T`
+"asserts" @keyword.operator
+
+[
+  "export"
+  "from"
+] @keyword.control.import
 
 [
   "type"
@@ -145,3 +155,17 @@
 (import_require_clause
   (identifier) "="
   ("require") @keyword)
+
+; Method signatures in interfaces / type literals, and function-typed
+; property signatures (`foo(): void`, `bar: () => void`).
+(method_signature
+  name: (property_identifier) @function.method)
+(abstract_method_signature
+  name: (property_identifier) @function.method)
+(property_signature
+  name: (property_identifier) @function.method
+  type: (type_annotation
+    [
+      (function_type)
+      (union_type (parenthesized_type (function_type)))
+    ]))

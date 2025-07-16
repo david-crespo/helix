@@ -1,5 +1,5 @@
 use crate::{graphics::Rect, View, ViewId};
-use slotmap::HopSlotMap;
+use slotmap::SlotMap;
 
 // the dimensions are recomputed on window resize/tree change.
 //
@@ -11,7 +11,7 @@ pub struct Tree {
     // fullscreen: bool,
     area: Rect,
 
-    nodes: HopSlotMap<ViewId, Node>,
+    nodes: SlotMap<ViewId, Node>,
 
     // used for traversals
     stack: Vec<(ViewId, Rect)>,
@@ -87,7 +87,7 @@ impl Tree {
     pub fn new(area: Rect) -> Self {
         let root = Node::container(Layout::Vertical);
 
-        let mut nodes = HopSlotMap::with_key();
+        let mut nodes = SlotMap::with_key();
         let root = nodes.insert(root);
 
         // root is it's own parent
@@ -328,6 +328,19 @@ impl Tree {
         }
     }
 
+    /// Try to get a mutable reference to a [View] by index.
+    ///
+    /// Does not panic if the view does not exist anymore
+    pub fn try_get_mut(&mut self, index: ViewId) -> Option<&mut View> {
+        match self.nodes.get_mut(index) {
+            Some(Node {
+                content: Content::View(view),
+                ..
+            }) => Some(view),
+            _ => None,
+        }
+    }
+
     /// Check if tree contains a [Node] with a given index.
     pub fn contains(&self, index: ViewId) -> bool {
         self.nodes.contains_key(index)
@@ -441,7 +454,7 @@ impl Tree {
         }
     }
 
-    pub fn traverse(&self) -> Traverse {
+    pub fn traverse(&self) -> Traverse<'_> {
         Traverse::new(self)
     }
 
@@ -668,6 +681,13 @@ impl Tree {
 
     pub fn area(&self) -> Rect {
         self.area
+    }
+
+    pub fn view_id_area(&self, id: ViewId) -> Option<Rect> {
+        self.nodes.get(id).map(|node| match &node.content {
+            Content::View(v) => v.area,
+            Content::Container(c) => c.area,
+        })
     }
 }
 
@@ -957,8 +977,7 @@ mod test {
 
         assert_eq!(10, tree.views().count());
         assert_eq!(
-            std::iter::repeat(7)
-                .take(9)
+            std::iter::repeat_n(7, 9)
                 .chain(Some(8)) // Rounding in `recalculate`.
                 .collect::<Vec<_>>(),
             tree.views()

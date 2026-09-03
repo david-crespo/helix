@@ -1616,6 +1616,9 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 helix_event::dispatch(TerminalFocusGained { cx: &mut cx });
+                if context.editor.config().auto_reload.focus_gained {
+                    crate::handlers::auto_reload::reload_externally_modified(context.editor);
+                }
                 self.terminal_focused = true;
                 EventResult::Consumed(None)
             }

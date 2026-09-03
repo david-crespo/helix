@@ -1143,6 +1143,10 @@ pub struct AutoReload {
     /// Whether to check for file changes when the editor is focused. Defaults to false.
     #[serde(default)]
     pub focus_gained: bool,
+    /// Whether buffers with unsaved changes are three-way merged with the file
+    /// on disk (conflicts left as markers) instead of being left alone. Defaults to false.
+    #[serde(default)]
+    pub merge: bool,
     /// Autosave periodically at some interval. Defaults to disabled.
     #[serde(default)]
     pub periodic: AutoReloadPeriodic,

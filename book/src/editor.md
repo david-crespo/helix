@@ -319,6 +319,7 @@ Controls auto reloading of externally modified files.
 | Key | Description | Default |
 |--|--|---------|
 | `focus-gained` | Enable automatic reloading of externally modified files when Helix is focused. Requires [focus event support](https://github.com/helix-editor/helix/wiki/Terminal-Support) from your terminal | `false` |
+| `merge` | Three-way merge external changes into buffers that have unsaved edits (base is the text as of the last save). Overlapping changes are left as conflict markers in the buffer. When off, modified buffers are left alone | `false` |
 | `periodic.enable` | Enable periodic auto reloading of externally modified files | `false` |
 | `periodic.interval` | Time interval in milliseconds between auto reload checks | `3000` |
 

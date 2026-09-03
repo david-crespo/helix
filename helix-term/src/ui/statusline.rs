@@ -186,7 +186,7 @@ where
         helix_view::editor::StatusLineElement::SearchPosition => render_search_position,
         helix_view::editor::StatusLineElement::CodeActionHint => render_code_action_hint,
         #[cfg(feature = "steel")]
-    _ => unreachable!(),
+        _ => unreachable!(),
     }
 }
 

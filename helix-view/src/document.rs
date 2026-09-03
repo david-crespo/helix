@@ -1348,6 +1348,74 @@ impl Document {
         Ok(())
     }
 
+    /// Three-way merge the file on disk into a buffer that has unsaved changes.
+    /// The base is the text as of the last save (recovered from the undo
+    /// history), ours is the buffer, theirs is disk. Non-overlapping changes
+    /// merge cleanly; overlapping ones are left in the buffer as git-style
+    /// conflict markers labelled `buffer (unsaved)` and `disk`. The buffer
+    /// stays modified so the next save writes the result. Returns the number
+    /// of conflicts.
+    pub fn merge_from_disk(&mut self, view: &mut View) -> Result<usize, Error> {
+        let encoding = self.encoding;
+        let path = match self.path() {
+            None => return Ok(0),
+            Some(path) => match path.exists() {
+                true => path.to_owned(),
+                false => bail!("can't find file to merge from {:?}", self.display_name()),
+            },
+        };
+        self.detect_readonly();
+
+        let mut file = std::fs::File::open(&path)?;
+        let (theirs, ..) = from_reader(&mut file, Some(encoding))?;
+
+        // Make sure any pending changes are in the history so the base is exact.
+        self.append_changes_to_history(view);
+        let mut base = self.text().clone();
+        if let Some(back_to_saved) = self
+            .history
+            .get_mut()
+            .changes_until(self.last_saved_revision)
+        {
+            back_to_saved.apply(&mut base);
+        }
+
+        let options = {
+            let mut o = diffy::MergeOptions::new();
+            o.set_conflict_style(diffy::ConflictStyle::Merge)
+                .set_incomplete_hunk_style(diffy::IncompleteHunkStyle::Git);
+            o
+        };
+        let ours = self.text().to_string();
+        let (merged, conflicts) = match options.merge(&base.to_string(), &ours, &theirs.to_string())
+        {
+            Ok(clean) => (clean, 0),
+            Err(with_markers) => {
+                let mut conflicts = 0;
+                let relabelled: String = with_markers
+                    .split_inclusive('\n')
+                    .map(|line| match line.trim_end_matches(['\n', '\r']) {
+                        "<<<<<<< ours" => {
+                            conflicts += 1;
+                            line.replacen("ours", "buffer (unsaved)", 1)
+                        }
+                        ">>>>>>> theirs" => line.replacen("theirs", "disk", 1),
+                        _ => line.to_owned(),
+                    })
+                    .collect();
+                (relabelled, conflicts)
+            }
+        };
+
+        let transaction = helix_core::diff::compare_ropes(self.text(), &Rope::from(merged));
+        self.apply(&transaction, view.id);
+        self.append_changes_to_history(view);
+        // The merged buffer is deliberately newer than disk; record disk's mtime
+        // so the next save isn't rejected as clobbering an external change.
+        self.pickup_last_saved_time();
+        Ok(conflicts)
+    }
+
     /// Sets the [`Document`]'s encoding with the encoding correspondent to `label`.
     pub fn set_encoding(&mut self, label: &str) -> Result<(), Error> {
         let encoding =

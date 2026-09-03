@@ -122,9 +122,20 @@ impl History {
     /// Returns the changes since the given revision composed into a transaction.
     /// Returns None if there are no changes between the current and given revisions.
     pub fn changes_since(&self, revision: usize) -> Option<Transaction> {
-        let lca = self.lowest_common_ancestor(revision, self.current);
-        let up = self.path_up(revision, lca);
-        let down = self.path_up(self.current, lca);
+        self.changes_between(revision, self.current)
+    }
+
+    /// Returns the changes that take the current revision back to the given
+    /// revision composed into a transaction (the inverse of `changes_since`).
+    /// Returns None if there are no changes between the current and given revisions.
+    pub fn changes_until(&self, revision: usize) -> Option<Transaction> {
+        self.changes_between(self.current, revision)
+    }
+
+    fn changes_between(&self, from: usize, to: usize) -> Option<Transaction> {
+        let lca = self.lowest_common_ancestor(from, to);
+        let up = self.path_up(from, lca);
+        let down = self.path_up(to, lca);
         let up_txns = up
             .iter()
             .rev()

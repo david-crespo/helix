@@ -736,6 +736,34 @@ where
     *mut_ref = f(mem::take(mut_ref));
 }
 
+/// Saves each version of a conflicted auto-reload merge under
+/// `<cache>/auto-reload-merges/<unix ms>-<file name>/` for debugging, and
+/// logs where.
+fn dump_merge(path: &Path, versions: &[(&str, &str)]) {
+    let millis = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let dir = helix_loader::cache_dir()
+        .join("auto-reload-merges")
+        .join(format!("{millis}-{name}"));
+    let result = std::fs::create_dir_all(&dir).and_then(|_| {
+        versions
+            .iter()
+            .try_for_each(|(label, text)| std::fs::write(dir.join(label), text))
+    });
+    match result {
+        Ok(()) => log::warn!(
+            "auto-reload: saved the merge's versions to {}",
+            dir.display()
+        ),
+        Err(err) => log::warn!(
+            "auto-reload: couldn't save the merge's versions to {}: {err}",
+            dir.display()
+        ),
+    }
+}
+
 use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName};
 use helix_stdx::Url;
 
@@ -1406,6 +1434,27 @@ impl Document {
                 (relabelled, conflicts)
             }
         };
+
+        let base = base.to_string();
+        let theirs = theirs.to_string();
+        log::warn!(
+            "auto-reload: merged {} into modified buffer: base {} bytes, buffer {} bytes, disk {} bytes, {conflicts} conflict(s)",
+            path.display(),
+            base.len(),
+            ours.len(),
+            theirs.len(),
+        );
+        if conflicts > 0 {
+            dump_merge(
+                &path,
+                &[
+                    ("base", &base),
+                    ("buffer", &ours),
+                    ("disk", &theirs),
+                    ("merged", &merged),
+                ],
+            );
+        }
 
         let transaction = helix_core::diff::compare_ropes(self.text(), &Rope::from(merged));
         self.apply(&transaction, view.id);

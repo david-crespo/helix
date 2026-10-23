@@ -314,7 +314,9 @@ name = "rust"
 
 ### `[editor.auto-reload]` Section
 
-Controls auto reloading of externally modified files.
+Controls auto reloading of externally modified files. A file written to in the last 150ms is left for the next check, so a file that isn't written atomically (like a jj checkout) isn't read half-written.
+
+Every merge into a modified buffer is logged to `helix.log` with the sizes of the base, the buffer and the file on disk. A merge that leaves conflicts also saves all three versions and the result under `auto-reload-merges/` in the cache directory, next to `helix.log`.
 
 | Key | Description | Default |
 |--|--|---------|

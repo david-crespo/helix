@@ -1,7 +1,7 @@
 use std::fs;
 use std::sync::atomic::{self, AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use helix_event::{register_hook, send_blocking};
 use helix_view::document::Mode;
@@ -82,9 +82,17 @@ pub fn reload_externally_modified(editor: &mut Editor) {
     let merge = editor.config().auto_reload.merge;
     let focused_view = view!(editor).id;
 
+    let mut settling = false;
     let stale: Vec<(DocumentId, Vec<ViewId>)> = editor
         .documents_mut()
-        .filter(|doc| is_externally_modified(doc) && (merge || !doc.is_modified()))
+        .filter(|doc| match disk_change(doc) {
+            DiskChange::None => false,
+            DiskChange::Settling => {
+                settling = true;
+                false
+            }
+            DiskChange::Settled => merge || !doc.is_modified(),
+        })
         .map(|doc| {
             let mut view_ids: Vec<_> = doc.selections().keys().cloned().collect();
             if view_ids.is_empty() {
@@ -94,6 +102,14 @@ pub fn reload_externally_modified(editor: &mut Editor) {
             (doc.id(), view_ids)
         })
         .collect();
+    if settling {
+        send_blocking(
+            &editor.handlers.auto_reload,
+            AutoReloadEvent::CheckForChanges {
+                after: SETTLE.as_millis() as u64,
+            },
+        );
+    }
 
     let mut reloaded = 0;
     let mut merged = 0;
@@ -168,14 +184,41 @@ fn schedule_next_check(editor: &Editor) {
     }
 }
 
-/// True when the file on disk is newer than helix's last save of it.
-fn is_externally_modified(doc: &Document) -> bool {
+/// How long a file must go unwritten before it's read. Writers that aren't
+/// atomic leave the file briefly empty or partial: a jj checkout deletes the
+/// file, recreates it empty and then streams the contents in. Read in that
+/// window, a modified buffer gets merged against an empty file.
+const SETTLE: Duration = Duration::from_millis(150);
+
+enum DiskChange {
+    None,
+    /// Changed, but written to within `SETTLE`, so possibly mid-write
+    Settling,
+    Settled,
+}
+
+/// Whether the file on disk is newer than helix's last save of it.
+fn disk_change(doc: &Document) -> DiskChange {
     let Some(path) = doc.path() else {
-        return false;
+        return DiskChange::None;
     };
-    match fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(modified) => modified > doc.last_saved_time(),
-        Err(_) => false,
+    let Ok(modified) = fs::metadata(path).and_then(|m| m.modified()) else {
+        return DiskChange::None;
+    };
+    if modified <= doc.last_saved_time() {
+        return DiskChange::None;
+    }
+    // An mtime in the future (clock skew) counts as settled, or it would
+    // never be read
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) if age < SETTLE => {
+            log::info!(
+                "auto-reload: {} changed {age:?} ago, waiting for it to settle",
+                path.display()
+            );
+            DiskChange::Settling
+        }
+        _ => DiskChange::Settled,
     }
 }
 

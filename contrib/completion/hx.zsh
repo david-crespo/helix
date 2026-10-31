@@ -21,6 +21,11 @@ _hx() {
 		"-w[Specify initial working directory]" \
 		"--working-dir[Specify initial working directory]" \
 		"--log[Specifies a file to use for logging]" \
+		"-s[Join the editor shared under this name]:name:" \
+		"--session[Join the editor shared under this name]:name:" \
+		"--no-session[Run a separate editor even if sessions are on]" \
+		"--remote[Open the files in the session's last used terminal and exit]" \
+		"--wait[With --remote, exit once none of the files is shown]" \
 		"*:file:_files"
 
 	case "$state" in

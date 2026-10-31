@@ -1,6 +1,14 @@
-use crate::{graphics::Rect, View, ViewId};
+use crate::{graphics::Rect, ClientId, View, ViewId};
 use slotmap::SlotMap;
+use std::collections::HashMap;
 
+/// The views of every client, each client with its own layout.
+///
+/// All views live in one map, so a `ViewId` is unique across clients and lookups and
+/// [`Tree::views`] cover every client. The layout fields (`root`, `focus`, `area`) belong to the
+/// active client; the other clients' layouts wait in `parked` until [`Tree::activate`] swaps
+/// them in. Methods that work on a layout, such as [`Tree::split`] and [`Tree::traverse`], use
+/// the active client's.
 // the dimensions are recomputed on window resize/tree change.
 //
 #[derive(Debug)]
@@ -11,10 +19,21 @@ pub struct Tree {
     // fullscreen: bool,
     area: Rect,
 
+    active: ClientId,
+    parked: HashMap<ClientId, ClientLayout>,
+
     nodes: SlotMap<ViewId, Node>,
 
     // used for traversals
     stack: Vec<(ViewId, Rect)>,
+}
+
+/// A client's layout while another client is active.
+#[derive(Debug, Clone, Copy)]
+struct ClientLayout {
+    root: ViewId,
+    focus: ViewId,
+    area: Rect,
 }
 
 #[derive(Debug)]
@@ -98,9 +117,122 @@ impl Tree {
             focus: root,
             // fullscreen: false,
             area,
+            active: ClientId::default(),
+            parked: HashMap::new(),
             nodes,
             stack: Vec::new(),
         }
+    }
+
+    /// The client whose layout the layout methods use.
+    pub fn active_client(&self) -> ClientId {
+        self.active
+    }
+
+    /// Adds an empty layout for a new client. It stays inactive until [`Tree::activate`].
+    pub fn add_client(&mut self, client: ClientId, area: Rect) {
+        assert!(
+            client != self.active && !self.parked.contains_key(&client),
+            "client {client} already has a layout"
+        );
+        let root = self.nodes.insert(Node::container(Layout::Vertical));
+        self.nodes[root].parent = root;
+        self.parked.insert(
+            client,
+            ClientLayout {
+                root,
+                focus: root,
+                area,
+            },
+        );
+    }
+
+    /// Removes an inactive client's layout. Its views must already be removed.
+    pub fn remove_client(&mut self, client: ClientId) {
+        assert!(client != self.active, "can't remove the active client");
+        let layout = self.parked.remove(&client).expect("client has a layout");
+        assert!(
+            self.is_empty_node(layout.root),
+            "client {client} still has views"
+        );
+        self.nodes.remove(layout.root);
+    }
+
+    /// Makes `client`'s layout the one the layout methods use. Only `Editor::activate` switches
+    /// clients for good, so the tree and the editor agree on which client is active; other code
+    /// borrows a client's layout with [`Tree::with_client`].
+    pub(crate) fn activate(&mut self, client: ClientId) {
+        if client == self.active {
+            return;
+        }
+        let next = self.parked.remove(&client).expect("client has a layout");
+        let current = ClientLayout {
+            root: self.root,
+            focus: self.focus,
+            area: self.area,
+        };
+        self.parked.insert(self.active, current);
+        self.active = client;
+        self.root = next.root;
+        self.focus = next.focus;
+        self.area = next.area;
+    }
+
+    /// Runs `f` with `client`'s layout active, then switches back.
+    fn with_client<R>(&mut self, client: ClientId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let active = self.active;
+        self.activate(client);
+        let result = f(self);
+        self.activate(active);
+        result
+    }
+
+    /// Adds `view` to `client`'s layout, after that client's focused view, and focuses it there.
+    pub fn insert_into(&mut self, client: ClientId, view: View) -> ViewId {
+        self.with_client(client, |tree| tree.insert(view))
+    }
+
+    /// The views in `client`'s layout.
+    pub fn client_views(&mut self, client: ClientId) -> Vec<ViewId> {
+        self.with_client(client, |tree| tree.traverse().map(|(id, _)| id).collect())
+    }
+
+    /// The active client's views, in the same order as [`Tree::views`], with whether each is
+    /// focused.
+    pub fn active_views(&self) -> impl Iterator<Item = (&View, bool)> {
+        self.views()
+            .filter(|(view, _)| self.client_of(view.id) == self.active)
+    }
+
+    /// Every client with a layout, the active one first.
+    pub fn clients(&self) -> impl Iterator<Item = ClientId> + '_ {
+        std::iter::once(self.active).chain(self.parked.keys().copied())
+    }
+
+    /// Clients whose layouts have no views left.
+    pub fn empty_clients(&self) -> impl Iterator<Item = ClientId> + '_ {
+        std::iter::once((self.active, self.root))
+            .chain(
+                self.parked
+                    .iter()
+                    .map(|(client, layout)| (*client, layout.root)),
+            )
+            .filter_map(|(client, root)| self.is_empty_node(root).then_some(client))
+    }
+
+    /// The client whose layout contains `view`.
+    pub(crate) fn client_of(&self, view: ViewId) -> ClientId {
+        let mut node = view;
+        while self.nodes[node].parent != node {
+            node = self.nodes[node].parent;
+        }
+        if node == self.root {
+            return self.active;
+        }
+        self.parked
+            .iter()
+            .find_map(|(client, layout)| (layout.root == node).then_some(*client))
+            .expect("every root belongs to a client")
     }
 
     pub fn insert(&mut self, view: View) -> ViewId {
@@ -247,7 +379,13 @@ impl Tree {
         }
     }
 
+    /// Removes a view from whichever client's layout holds it.
     pub fn remove(&mut self, index: ViewId) {
+        let owner = self.client_of(index);
+        self.with_client(owner, |tree| tree.remove_from_active(index));
+    }
+
+    fn remove_from_active(&mut self, index: ViewId) {
         if self.focus == index {
             // focus on something else
             self.focus = self.prev();
@@ -347,7 +485,11 @@ impl Tree {
     }
 
     pub fn is_empty(&self) -> bool {
-        match &self.nodes[self.root] {
+        self.is_empty_node(self.root)
+    }
+
+    fn is_empty_node(&self, node: ViewId) -> bool {
+        match &self.nodes[node] {
             Node {
                 content: Content::Container(container),
                 ..
@@ -984,5 +1126,84 @@ mod test {
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn two_clients() -> (Tree, ClientId, ClientId) {
+        let mut tree = Tree::new(Rect::new(0, 0, 80, 24));
+        tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        let (a, b) = (ClientId(0), ClientId(1));
+        tree.add_client(b, Rect::new(0, 0, 100, 40));
+        tree.activate(b);
+        tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        tree.split(
+            View::new(DocumentId::default(), GutterConfig::default()),
+            Layout::Vertical,
+        );
+        (tree, a, b)
+    }
+
+    #[test]
+    fn activate_swaps_layout() {
+        let (mut tree, a, b) = two_clients();
+        let b_focus = tree.focus;
+        assert_eq!(tree.area(), Rect::new(0, 0, 100, 40));
+        assert_eq!(tree.traverse().count(), 2);
+
+        tree.activate(a);
+        assert_eq!(tree.active_client(), a);
+        assert_eq!(tree.area(), Rect::new(0, 0, 80, 24));
+        assert_ne!(tree.focus, b_focus);
+        assert_eq!(tree.client_of(tree.focus), a);
+        assert_eq!(tree.client_of(b_focus), b);
+        // Every client's views, but only the active client's layout.
+        assert_eq!(tree.views().count(), 3);
+        assert_eq!(tree.traverse().count(), 1);
+
+        tree.activate(b);
+        assert_eq!(tree.focus, b_focus);
+    }
+
+    #[test]
+    fn active_views_keep_slot_order() {
+        let mut tree = Tree::new(Rect::new(0, 0, 80, 24));
+        let view = || View::new(DocumentId::default(), GutterConfig::default());
+        let first = tree.insert(view());
+        let second = tree.split(view(), Layout::Vertical);
+        tree.remove(first);
+        // Takes the slot `first` left, so slot order and layout order now differ.
+        let third = tree.split(view(), Layout::Vertical);
+        let ids = |views: Vec<(&View, bool)>| views.iter().map(|(v, _)| v.id).collect::<Vec<_>>();
+        assert_eq!(ids(tree.views().collect()), [third, second]);
+        assert_eq!(ids(tree.active_views().collect()), [third, second]);
+
+        let b = ClientId(1);
+        tree.add_client(b, Rect::new(0, 0, 80, 24));
+        tree.activate(b);
+        let b_view = tree.insert(view());
+        assert_eq!(ids(tree.active_views().collect()), [b_view]);
+        tree.activate(ClientId(0));
+        assert_eq!(ids(tree.active_views().collect()), [third, second]);
+    }
+
+    #[test]
+    fn remove_view_of_inactive_client() {
+        let (mut tree, a, b) = two_clients();
+        let b_focus = tree.focus;
+        let b_other = tree.prev();
+        tree.activate(a);
+        let a_focus = tree.focus;
+
+        tree.remove(b_focus);
+        assert_eq!(tree.focus, a_focus, "the active client keeps its focus");
+        tree.activate(b);
+        assert_eq!(tree.focus, b_other, "the inactive client's focus moves");
+        assert_eq!(tree.get(b_other).area.width, 100, "and its layout reflows");
+
+        tree.remove(b_other);
+        assert!(tree.is_empty());
+        tree.activate(a);
+        tree.remove_client(b);
+        assert_eq!(tree.clients().collect::<Vec<_>>(), [a]);
+        assert_eq!(tree.views().count(), 1);
     }
 }

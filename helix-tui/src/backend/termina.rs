@@ -36,15 +36,12 @@ macro_rules! decreset {
     };
 }
 
-fn term_program() -> Option<String> {
+fn term_program(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     // Some terminals don't set $TERM_PROGRAM
-    match std::env::var("TERM_PROGRAM") {
-        Err(_) => std::env::var("TERM").ok(),
-        Ok(term_program) => Some(term_program),
-    }
+    env("TERM_PROGRAM").or_else(|| env("TERM"))
 }
-fn vte_version() -> Option<usize> {
-    std::env::var("VTE_VERSION").ok()?.parse().ok()
+fn vte_version(env: &dyn Fn(&str) -> Option<String>) -> Option<usize> {
+    env("VTE_VERSION")?.parse().ok()
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -84,13 +81,28 @@ pub struct TerminaBackend {
     /// The terminal emulator's background color. This is queried when claiming the terminal so
     /// that custom colors set outside of Helix with OSC11 are restored when Helix exits.
     original_background_color: Option<RgbColor>,
+    /// Whether the terminal is set up for us. While it isn't, another process may be using it,
+    /// so we leave it alone.
+    claimed: bool,
 }
 
 impl TerminaBackend {
     pub fn new(config: Config) -> io::Result<Self> {
-        use std::time::{Duration, Instant};
+        let mut backend = Self::with_terminal(PlatformTerminal::new()?, config, &|name| {
+            std::env::var(name).ok()
+        })?;
+        backend.set_panic_hook();
+        Ok(backend)
+    }
 
-        let mut terminal = PlatformTerminal::new()?;
+    /// Claims `terminal`, which need not be this process's own. `env` looks up variables in the
+    /// environment of the program the terminal belongs to, which describe the terminal.
+    pub fn with_terminal(
+        mut terminal: PlatformTerminal,
+        config: Config,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> io::Result<Self> {
+        use std::time::{Duration, Instant};
 
         // Colibri "midnight"
         const TEST_COLOR: RgbColor = RgbColor::new(59, 34, 76);
@@ -102,7 +114,7 @@ impl TerminaBackend {
         let start = Instant::now();
 
         // HACK: emitting OSC11 / OSC111 seems to break SGR and cause flickering in tmux.
-        capabilities.dynamic_background_color = std::env::var_os("TMUX").is_none();
+        capabilities.dynamic_background_color = env("TMUX").is_none();
 
         capabilities.kitty_keyboard = match config.kitty_keyboard_protocol {
             KittyKeyboardProtocolConfig::Disabled => KittyKeyboardSupport::None,
@@ -198,13 +210,13 @@ impl TerminaBackend {
         capabilities.extended_underlines |= config.force_enable_extended_underlines;
 
         let mut reset_cursor_command = String::new();
-        if let Ok(t) = termini::TermInfo::from_env() {
+        if let Some(Ok(t)) = env("TERM").map(|term| termini::TermInfo::from_name(&term)) {
             capabilities.extended_underlines |= t.extended_cap("Smulx").is_some()
                 || t.extended_cap("Su").is_some()
-                || vte_version() >= Some(5102)
+                || vte_version(env) >= Some(5102)
                 // HACK: once WezTerm can support DECRQSS/DECRPSS for SGR we can remove this line.
                 // <https://github.com/wezterm/wezterm/pull/6856>
-                || matches!(term_program().as_deref(), Some("WezTerm"));
+                || matches!(term_program(env).as_deref(), Some("WezTerm"));
 
             if let Some(termini::Value::Utf8String(se_str)) = t.extended_cap("Se") {
                 reset_cursor_command.push_str(se_str);
@@ -224,11 +236,24 @@ impl TerminaBackend {
 
         terminal.enter_cooked_mode()?;
 
-        // In the case of a panic, reset the terminal eagerly. If we didn't do this and instead
-        // relied on `Drop`, the backtrace would be lost because it is printed before we would
-        // clear and exit the alternate screen.
-        let hook_reset_cursor_command = reset_cursor_command.clone();
-        terminal.set_panic_hook(move |term| {
+        Ok(Self {
+            terminal,
+            config,
+            capabilities,
+            reset_cursor_command,
+            is_synchronized_output_set: false,
+            background_color: None,
+            original_background_color,
+            claimed: false,
+        })
+    }
+
+    /// Resets the terminal eagerly on a panic. If we relied on `Drop` instead, the backtrace
+    /// would be lost because it is printed before we clear and exit the alternate screen. Only
+    /// for the process's own terminal: one passed in from elsewhere is its owner's to restore.
+    fn set_panic_hook(&mut self) {
+        let hook_reset_cursor_command = self.reset_cursor_command.clone();
+        self.terminal.set_panic_hook(move |term| {
             let _ = write!(
                 term,
                 "{}{}{}{}{}{}{}{}{}{}{}{}",
@@ -246,16 +271,6 @@ impl TerminaBackend {
                 decreset!(ClearAndEnableAlternateScreen),
             );
         });
-
-        Ok(Self {
-            terminal,
-            config,
-            capabilities,
-            reset_cursor_command,
-            is_synchronized_output_set: false,
-            background_color: None,
-            original_background_color,
-        })
     }
 
     pub fn terminal(&self) -> &PlatformTerminal {
@@ -437,13 +452,14 @@ impl Backend for TerminaBackend {
         }
         self.enable_mouse_capture()?;
         self.enable_extensions()?;
+        self.claimed = true;
 
         Ok(())
     }
 
     fn reconfigure(&mut self, mut config: Config) -> io::Result<()> {
         std::mem::swap(&mut self.config, &mut config);
-        if self.config.enable_mouse_capture != config.enable_mouse_capture {
+        if self.claimed && self.config.enable_mouse_capture != config.enable_mouse_capture {
             if self.config.enable_mouse_capture {
                 self.enable_mouse_capture()?;
             } else {
@@ -455,6 +471,10 @@ impl Backend for TerminaBackend {
     }
 
     fn restore(&mut self) -> io::Result<()> {
+        if !self.claimed {
+            return Ok(());
+        }
+        self.claimed = false;
         self.disable_extensions()?;
         self.disable_mouse_capture()?;
         write!(
@@ -647,7 +667,7 @@ impl Drop for TerminaBackend {
     fn drop(&mut self) {
         // Avoid resetting the terminal while panicking because we set a panic hook above in
         // `Self::new`.
-        if !std::thread::panicking() {
+        if self.claimed && !std::thread::panicking() {
             let _ = self.disable_extensions();
             let _ = self.disable_mouse_capture();
             let _ = write!(

@@ -25,5 +25,9 @@ export extern hx [
     --vsplit,                                   # Splits all given files vertically into different windows
     --hsplit,                                   # Splits all given files horizontally into different windows
     --working-dir(-w): glob,                    # Specify an initial working directory
+    --session(-s): string,                      # Join the editor shared under this name, starting it if needed
+    --no-session,                               # Run a separate editor instead of joining the session
+    --remote,                                   # Open the files in the session's last used terminal and exit
+    --wait,                                     # With --remote, exit once none of the files is shown
     ...files: glob,                             # Sets the input file to use, position can also be specified via file[:row[:col]]
 ]

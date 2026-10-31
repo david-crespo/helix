@@ -2662,9 +2662,11 @@ fn global_search(cx: &mut Context) {
     }
 
     impl FileResult<'_> {
-        fn new(path: &Path, line_start: usize, line_end: usize) -> Self {
+        /// `path` is shown relative to `cwd`, which this takes because it runs off the main
+        /// thread, where the client that started the search may not be the active one.
+        fn new(path: &Path, cwd: &Path, line_start: usize, line_end: usize) -> Self {
             Self {
-                path: helix_stdx::path::get_relative_path(path.to_path_buf()),
+                path: path.strip_prefix(cwd).unwrap_or(path).to_path_buf().into(),
                 line_start,
                 line_end,
             }
@@ -2739,7 +2741,7 @@ fn global_search(cx: &mut Context) {
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .multi_line(true)
                 .build();
-            WalkBuilder::new(search_root)
+            WalkBuilder::new(&search_root)
                 .hidden(config.file_picker_config.hidden)
                 .parents(config.file_picker_config.parents)
                 .ignore(config.file_picker_config.ignore)
@@ -2759,6 +2761,7 @@ fn global_search(cx: &mut Context) {
                     let matcher = matcher.clone();
                     let injector = injector.clone();
                     let documents = &documents;
+                    let search_root = &search_root;
                     Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
                         let entry = match entry {
                             Ok(entry) => entry,
@@ -2774,7 +2777,12 @@ fn global_search(cx: &mut Context) {
                             let line_start = line_start as usize - 1;
                             let line_end = line_start + line_content.lines().count() - 1;
                             stop = injector
-                                .push(FileResult::new(entry.path(), line_start, line_end))
+                                .push(FileResult::new(
+                                    entry.path(),
+                                    search_root,
+                                    line_start,
+                                    line_end,
+                                ))
                                 .is_err();
 
                             Ok(!stop)
@@ -3551,7 +3559,7 @@ fn jumplist_picker(cx: &mut Context) {
     let picker = Picker::new(
         columns,
         1, // path
-        cx.editor.tree.views().flat_map(|(view, _)| {
+        cx.editor.tree.active_views().flat_map(|(view, _)| {
             view.jumps
                 .iter()
                 .rev()
@@ -6095,7 +6103,7 @@ fn vsplit_new(cx: &mut Context) {
 }
 
 fn wclose(cx: &mut Context) {
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.tree.active_views().count() == 1 {
         if let Err(err) = typed::buffers_remaining_impl(cx.editor) {
             cx.editor.set_error(err.to_string());
             return;
@@ -6110,7 +6118,7 @@ fn wonly(cx: &mut Context) {
     let views = cx
         .editor
         .tree
-        .views()
+        .active_views()
         .map(|(v, focus)| (v.id, focus))
         .collect::<Vec<_>>();
     for (view_id, focus) in views {
@@ -6668,24 +6676,30 @@ fn shell_keep_pipe(cx: &mut Context) {
 }
 
 fn shell_impl(shell: &[String], cmd: &str, input: Option<Rope>) -> anyhow::Result<Tendril> {
-    tokio::task::block_in_place(|| helix_lsp::block_on(shell_impl_async(shell, cmd, input)))
+    let process = shell_command(shell, cmd)?;
+    tokio::task::block_in_place(|| helix_lsp::block_on(shell_impl_async(process, input)))
 }
 
-async fn shell_impl_async(
-    shell: &[String],
-    cmd: &str,
-    input: Option<Rope>,
-) -> anyhow::Result<Tendril> {
+/// Builds a shell command in the active client's working directory. Build it before handing
+/// it to a job, since another client may be active by the time the job runs.
+fn shell_command(shell: &[String], cmd: &str) -> anyhow::Result<tokio::process::Command> {
     use std::process::Stdio;
-    use tokio::process::Command;
     ensure!(!shell.is_empty(), "No shell set");
 
-    let mut process = Command::new(&shell[0]);
+    let mut process = tokio::process::Command::from(helix_stdx::env::command(&shell[0]));
     process
         .args(&shell[1..])
         .arg(cmd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    Ok(process)
+}
+
+async fn shell_impl_async(
+    mut process: tokio::process::Command,
+    input: Option<Rope>,
+) -> anyhow::Result<Tendril> {
+    use std::process::Stdio;
 
     if input.is_some() || cfg!(windows) {
         process.stdin(Stdio::piped());
@@ -6851,6 +6865,11 @@ fn shell_prompt_for_behavior(cx: &mut Context, prompt: Cow<'static, str>, behavi
 fn suspend(_cx: &mut Context) {
     #[cfg(not(windows))]
     {
+        if crate::session::is_server() {
+            crate::session::request_suspend(_cx.editor.active_client());
+            return;
+        }
+
         // SAFETY: These are calls to standard POSIX functions.
         // Unsafe is necessary since we are calling outside of Rust.
         let is_session_leader = unsafe { libc::getpid() == libc::getsid(0) };

@@ -20,13 +20,28 @@ pub struct Args {
     pub config_file: Option<PathBuf>,
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
+    /// Join the editor shared under this name.
+    pub session: Option<String>,
+    pub no_session: bool,
+    /// Run the shared editor for this session key. Started by the first client.
+    pub session_server: Option<String>,
+    /// Open the files in the session's focused client rather than this terminal.
+    pub remote: bool,
+    /// With `remote`, wait until none of the files is shown.
+    pub wait: bool,
 }
 
 impl Args {
-    #[allow(clippy::too_many_lines)]
     pub fn parse_args() -> Result<Args> {
+        Self::parse(std::env::args())
+    }
+
+    /// Parses a command line, starting with the program name. Relative paths resolve against
+    /// [`helix_stdx::env::current_working_dir`].
+    #[allow(clippy::too_many_lines)]
+    pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Args> {
         let mut args = Args::default();
-        let mut argv = std::env::args().peekable();
+        let mut argv = argv.into_iter().peekable();
         let mut line_number = 0;
 
         let mut insert_file_with_position = |file_with_position: &str| {
@@ -72,6 +87,17 @@ impl Args {
                 "-c" | "--config" => match argv.next().as_deref() {
                     Some(path) => args.config_file = Some(path.into()),
                     None => anyhow::bail!("--config must specify a path to read"),
+                },
+                "-s" | "--session" => match argv.next() {
+                    Some(name) => args.session = Some(name),
+                    None => anyhow::bail!("--session must specify a session name"),
+                },
+                "--no-session" => args.no_session = true,
+                "--remote" => args.remote = true,
+                "--wait" => args.wait = true,
+                "--session-server" => match argv.next() {
+                    Some(key) => args.session_server = Some(key),
+                    None => anyhow::bail!("--session-server must specify a session key"),
                 },
                 "--log" => match argv.next().as_deref() {
                     Some(path) => args.log_file = Some(path.into()),

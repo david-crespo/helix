@@ -42,10 +42,12 @@ pub(crate) fn path_completion(
                 Path::new(&*matched_path).into()
             };
             let path = path::expand(&path);
-            let parent_dir = doc.path().and_then(|dp| dp.parent());
-            let path = match parent_dir {
-                Some(parent_dir) if path.is_relative() => parent_dir.join(&path),
-                _ => path.into_owned(),
+            // Relative to the document, or for a scratch buffer, the working directory. That
+            // has to be resolved here: the directory is read on another thread.
+            let path = match doc.path().and_then(|dp| dp.parent()) {
+                _ if path.is_absolute() => path.into_owned(),
+                Some(parent_dir) => parent_dir.join(&path),
+                None => helix_stdx::env::current_working_dir().join(&path),
             };
             #[cfg(windows)]
             let ends_with_slash = matches!(matched_path.as_bytes().last(), Some(b'/' | b'\\'));

@@ -3,13 +3,21 @@ use std::{
     borrow::Cow,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use once_cell::sync::Lazy;
 
 // We keep the CWD as a static so that we can access it in places where we don't have access to the Editor
 static CWD: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Environment variables for the programs we run, when they aren't this process's own.
+pub type Environment = Arc<[(OsString, OsString)]>;
+
+static ENVIRONMENT: RwLock<Option<Environment>> = RwLock::new(None);
 
 /// Get the current working directory.
 /// This information is managed internally as the call to std::env::current_dir
@@ -38,13 +46,52 @@ pub fn current_working_dir() -> PathBuf {
     cwd
 }
 
+static KEEP_PROCESS_DIR: AtomicBool = AtomicBool::new(false);
+
+/// Makes [`set_current_working_dir`] leave the process's working directory alone. A server
+/// shared by clients in different directories stays where it started, and everything that
+/// needs a client's directory reads [`current_working_dir`] instead.
+pub fn keep_process_working_dir() {
+    KEEP_PROCESS_DIR.store(true, Ordering::Relaxed);
+}
+
 /// Update the current working directory.
 pub fn set_current_working_dir(path: impl AsRef<Path>) -> std::io::Result<Option<PathBuf>> {
     let path = crate::path::canonicalize(path);
-    std::env::set_current_dir(&path)?;
+    if !KEEP_PROCESS_DIR.load(Ordering::Relaxed) {
+        std::env::set_current_dir(&path)?;
+    } else if !std::fs::metadata(&path)?.is_dir() {
+        return Err(std::io::ErrorKind::NotADirectory.into());
+    }
     let mut cwd = CWD.write().unwrap();
 
     Ok(cwd.replace(path))
+}
+
+/// Replaces the working directory [`current_working_dir`] reports, without changing the
+/// process's. A server with several clients swaps in the active client's directory this way.
+/// `None` means the process's working directory.
+pub fn swap_current_working_dir(path: Option<PathBuf>) -> Option<PathBuf> {
+    std::mem::replace(&mut *CWD.write().unwrap(), path)
+}
+
+/// Replaces the environment [`command`] gives programs. A server with several clients swaps in
+/// the active client's environment this way. `None` means the process's environment.
+pub fn swap_environment(env: Option<Environment>) -> Option<Environment> {
+    std::mem::replace(&mut *ENVIRONMENT.write().unwrap(), env)
+}
+
+/// A command that runs in [`current_working_dir`] with the environment from
+/// [`swap_environment`]. In a server, those are the active client's, not the process's.
+pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.current_dir(current_working_dir());
+    if let Some(env) = &*ENVIRONMENT.read().unwrap() {
+        command
+            .env_clear()
+            .envs(env.iter().map(|(key, value)| (key, value)));
+    }
+    command
 }
 
 /// Checks if the given environment variable is set.

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     str,
 };
@@ -394,6 +394,26 @@ fn build_theme_values(
     (styles, scopes, highlights, rainbow_length, warnings)
 }
 
+/// Highlight scopes for several themes to share, so that a syntax highlight means the same in
+/// each: every scope any of them defines, the rainbow scopes first, since rainbow highlights
+/// index them by nesting depth.
+pub fn shared_scopes<'a>(themes: impl IntoIterator<Item = &'a Theme>) -> Vec<String> {
+    let mut rainbow_length = 0;
+    let mut scopes = BTreeSet::new();
+    for theme in themes {
+        rainbow_length = rainbow_length.max(theme.rainbow_length);
+        scopes.extend(theme.styles.keys());
+    }
+    let mut shared: Vec<String> = (0..rainbow_length)
+        .map(|i| format!("rainbow.{i}"))
+        .collect();
+    for rainbow in &shared {
+        scopes.remove(rainbow);
+    }
+    shared.extend(scopes.into_iter().cloned());
+    shared
+}
+
 fn default_rainbow() -> Vec<Style> {
     vec![
         Style::default().fg(Color::Red),
@@ -451,16 +471,29 @@ impl Theme {
     }
 
     pub fn set(&mut self, scope: String, style: Style) {
-        if self.styles.insert(scope.to_string(), style).is_some() {
-            for (name, highlights) in self.scopes.iter().zip(self.highlights.iter_mut()) {
-                if *name == scope {
-                    *highlights = style;
-                }
-            }
-        } else {
-            self.scopes.push(scope);
-            self.highlights.push(style);
+        if !self.scopes.contains(&scope) {
+            self.scopes.push(scope.clone());
         }
+        self.styles.insert(scope, style);
+        self.index_scopes(self.scopes.clone());
+    }
+
+    /// Makes [`Highlight`]s index `scopes` rather than this theme's own scopes, so that several
+    /// themes can share one list (see [`shared_scopes`]). Each scope gets the style
+    /// [`Theme::try_get`] finds for it, which for a syntax capture is the style it would get
+    /// from this theme alone.
+    pub fn index_scopes(&mut self, scopes: Vec<String>) {
+        self.highlights = scopes
+            .iter()
+            .map(|scope| self.try_get(scope).unwrap_or_default())
+            .collect();
+        self.scope_index = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, scope)| self.styles.contains_key(*scope))
+            .map(|(i, scope)| (scope.clone(), Highlight::new(i as u32)))
+            .collect();
+        self.scopes = scopes;
     }
 
     /// Get the style of a scope, falling back to dot separated broader
@@ -798,5 +831,28 @@ mod tests {
     fn out_of_bounds() {
         let highlight = Highlight::new(Theme::rgb_highlight(0, 0, 0).get() - 1);
         Theme::default().highlight(highlight);
+    }
+
+    #[test]
+    fn shared_scopes_keep_each_themes_styles() {
+        let theme = |toml: &str| Theme::from_toml(toml::from_str(toml).unwrap()).0;
+        let mut red = theme("keyword = \"red\"");
+        let mut blue = theme("\"keyword.control\" = \"blue\"\nrainbow = [\"red\"]");
+        let shared = shared_scopes([&red, &blue]);
+        assert!(shared[..red.rainbow_length()]
+            .iter()
+            .enumerate()
+            .all(|(i, scope)| *scope == format!("rainbow.{i}")));
+
+        red.index_scopes(shared.clone());
+        blue.index_scopes(shared.clone());
+        let control = blue.find_highlight_exact("keyword.control").unwrap();
+        assert_eq!(red.highlight(control).fg, Some(Color::Red));
+        assert_eq!(blue.highlight(control).fg, Some(Color::Blue));
+        assert_eq!(red.find_highlight_exact("keyword.control"), None);
+        assert_eq!(
+            red.find_highlight("keyword.control"),
+            red.find_highlight("keyword")
+        );
     }
 }

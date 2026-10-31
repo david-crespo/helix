@@ -16,6 +16,10 @@ complete -c hx -l hsplit -d "Splits all given files horizontally"
 complete -c hx -s c -l config -r -d "Specifies a file to use for config"
 complete -c hx -l log -r -d "Specifies a file to use for logging"
 complete -c hx -s w -l working-dir -d "Specify initial working directory" -xa "(__fish_complete_directories)"
+complete -c hx -s s -l session -x -d "Join the editor shared under this name"
+complete -c hx -l no-session -d "Run a separate editor instead of joining the session"
+complete -c hx -l remote -d "Open the files in the session's last used terminal and exit"
+complete -c hx -l wait -d "With --remote, exit once none of the files is shown"
 
 function __hx_langs_ops
     hx --health all-languages | tail -n '+2' | string replace -fr '^(\S+) .*' '$1'

@@ -119,7 +119,7 @@ impl Client {
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
 
-        let process = Command::new(cmd)
+        let process = Command::from(helix_stdx::env::command(cmd))
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -170,7 +170,7 @@ impl Client {
     ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
         let port = Self::get_port().await.unwrap();
 
-        let process = Command::new(cmd)
+        let process = Command::from(helix_stdx::env::command(cmd))
             .args(args)
             .args(port_format.replace("{}", &port.to_string()).split(' '))
             // silence messages

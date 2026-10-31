@@ -16,7 +16,18 @@ use crate::{
 };
 
 /// Represents a single point in a text buffer. Zero indexed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Position {
     pub row: usize,
     pub col: usize,

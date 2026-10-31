@@ -117,7 +117,7 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
     }
 
     // last view and we have unsaved changes
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.tree.active_views().count() == 1 {
         buffers_remaining_impl(cx.editor)?
     }
 
@@ -149,15 +149,14 @@ fn open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
 fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow::Result<()> {
     for arg in args {
         let (path, pos) = crate::args::parse_file(&arg);
-        let path = helix_stdx::path::expand_tilde(path);
+        let path = helix_stdx::path::canonicalize(path);
         // If the path is a directory, open a file picker on that directory and update the status
         // message
-        if let Ok(true) = std::fs::canonicalize(&path).map(|p| p.is_dir()) {
+        if path.is_dir() {
             let callback = async move {
                 let call: job::Callback = job::Callback::EditorCompositor(Box::new(
                     move |editor: &mut Editor, compositor: &mut Compositor| {
-                        let picker =
-                            ui::file_picker(editor, path.into_owned()).with_default_action(action);
+                        let picker = ui::file_picker(editor, path).with_default_action(action);
                         compositor.push(Box::new(overlaid(picker)));
                     },
                 ));
@@ -817,11 +816,19 @@ fn force_write_quit(
 /// error, otherwise returns `Ok(())`. If the current document is unmodified,
 /// and there are modified documents, switches focus to one of them.
 pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> {
+    unsaved_buffers_impl(editor, false)
+}
+
+/// Like [`buffers_remaining_impl`], for when the active client leaves, or with `every_client`,
+/// when they all do.
+fn unsaved_buffers_impl(editor: &mut Editor, every_client: bool) -> anyhow::Result<()> {
     let modified_ids: Vec<_> = editor
         .documents()
         .filter(|doc| doc.is_modified())
         // Named scratch documents should not be included here
         .filter(|doc| doc.name.is_none())
+        // Nor those that stay for other clients
+        .filter(|doc| every_client || editor.leaves_with_active_client(doc))
         .map(|doc| doc.id())
         .collect();
 
@@ -1049,8 +1056,13 @@ fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()
         buffers_remaining_impl(cx.editor)?;
     }
 
-    // close all views
-    let views: Vec<_> = cx.editor.tree.views().map(|(view, _)| view.id).collect();
+    // close all of this client's views
+    let views: Vec<_> = cx
+        .editor
+        .tree
+        .active_views()
+        .map(|(view, _)| view.id)
+        .collect();
     for view_id in views {
         cx.editor.close(view_id);
     }
@@ -1076,6 +1088,41 @@ fn force_quit_all(
     }
 
     quit_all_impl(cx, true)
+}
+
+fn session_quit(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    session_quit_impl(cx, false)
+}
+
+fn force_session_quit(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    session_quit_impl(cx, true)
+}
+
+/// Closes every client's views, which ends the session. Without a session it's `:quit-all`.
+fn session_quit_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()> {
+    cx.block_try_flush_writes()?;
+    if !force {
+        unsaved_buffers_impl(cx.editor, true)?;
+    }
+    let views: Vec<_> = cx.editor.tree.views().map(|(view, _)| view.id).collect();
+    for view_id in views {
+        cx.editor.close(view_id);
+    }
+    Ok(())
 }
 
 fn cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -2666,11 +2713,10 @@ fn run_shell_command(
         return Ok(());
     }
 
-    let shell = cx.editor.config().shell.clone();
-    let args = args.join(" ");
+    let process = shell_command(&cx.editor.config().shell, &args.join(" "))?;
 
     let callback = async move {
-        let output = shell_impl_async(&shell, &args, None).await?;
+        let output = shell_impl_async(process, None).await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, compositor: &mut Compositor| {
                 if !output.trim().is_empty() {
@@ -3381,6 +3427,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "session-quit",
+        aliases: &[],
+        doc: "Close every client sharing this editor, ending the session.",
+        fun: session_quit,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "session-quit!",
+        aliases: &[],
+        doc: "Force close every client sharing this editor ignoring unsaved changes, ending the session.",
+        fun: force_session_quit,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

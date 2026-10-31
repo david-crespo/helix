@@ -490,7 +490,7 @@ impl Editor {
                             return true;
                         };
 
-                        let process = match std::process::Command::new(&config.command)
+                        let process = match helix_stdx::env::command(&config.command)
                             .args(&config.args)
                             .args(&arguments.args)
                             .spawn()

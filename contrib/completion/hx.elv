@@ -52,4 +52,8 @@ set edit:completion:arg-completer[hx] = {|@args|
   $candidate "--hsplit" "(Splits all given files horizontally)"
   $candidate "--config" "(Specifies a file to use for configuration)"
   $candidate "--log" "(Specifies a file to write log data into)"
+  $candidate "--session" "(Joins the editor shared under this name)"
+  $candidate "--no-session" "(Runs a separate editor instead of joining the session)"
+  $candidate "--remote" "(Opens the files in the session's last used terminal and exits)"
+  $candidate "--wait" "(With --remote, exits once none of the files is shown)"
 }

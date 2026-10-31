@@ -12,7 +12,7 @@ use crate::{
     register::Registers,
     theme::{self, Theme},
     tree::{self, Tree},
-    Document, DocumentId, View, ViewId,
+    ClientId, Document, DocumentId, View, ViewId,
 };
 use helix_event::dispatch;
 use helix_loader::workspace_trust::{ImplicitTrustLevel, TrustQuery, WorkspaceTrust};
@@ -27,8 +27,7 @@ use std::{
     borrow::Cow,
     cell::Cell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fs,
-    io::{self, stdin},
+    fs, io,
     num::{NonZeroU8, NonZeroUsize},
     path::{Path, PathBuf},
     pin::Pin,
@@ -432,6 +431,8 @@ pub struct Config {
     pub rainbow_brackets: bool,
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
+    /// Whether `hx` joins an editor shared by every terminal in the same session and workspace.
+    pub session: SessionConfig,
 
     pub buffer_picker: BufferPickerConfig,
 
@@ -545,6 +546,16 @@ impl PickerStartPosition {
     pub fn is_current(self) -> bool {
         matches!(self, Self::Current)
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionConfig {
+    /// Every `hx` is its own editor, unless started with `--session`.
+    Off,
+    /// `hx` joins the editor running for its session, starting one if there is none.
+    #[default]
+    Auto,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1351,6 +1362,7 @@ impl Default for Config {
             editor_config: true,
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
+            session: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
             #[cfg(feature = "steel")]
             enable_steel: true,
@@ -1467,6 +1479,86 @@ pub struct Editor {
 
     pub workspace_trust: WorkspaceTrust,
     pub file_watcher: Watcher,
+
+    /// The state of every client but the active one. See [`ClientState`].
+    parked_clients: HashMap<ClientId, ClientState>,
+}
+
+/// Editor state that belongs to one client. The active client's state lives in `Editor`'s own
+/// fields, so commands keep using `editor.mode` and friends. The other clients' state waits here
+/// until [`Editor::activate`] swaps it in.
+pub struct ClientState {
+    mode: Mode,
+    count: Option<NonZeroUsize>,
+    selected_register: Option<char>,
+    macro_recording: Option<(char, Vec<KeyEvent>)>,
+    macro_replaying: Vec<char>,
+    last_theme: Option<Theme>,
+    theme: Theme,
+    last_selection: Option<Selection>,
+    status_msg: Option<(Cow<'static, str>, Severity)>,
+    autoinfo: Option<Info>,
+    last_motion: Option<Motion>,
+    last_completion: Option<CompleteAction>,
+    last_cwd: Option<PathBuf>,
+    dir_stack: VecDeque<PathBuf>,
+    exit_code: i32,
+    mouse_down_range: Option<Range>,
+    cursor_cache: CursorCache,
+    /// Swapped into [`helix_stdx::env::current_working_dir`] rather than the process's cwd.
+    cwd: Option<PathBuf>,
+    /// Swapped into [`helix_stdx::env::command`]'s environment.
+    env: Option<helix_stdx::env::Environment>,
+}
+
+impl ClientState {
+    pub fn new(theme: Theme, cwd: PathBuf, env: helix_stdx::env::Environment) -> Self {
+        Self {
+            mode: Mode::Normal,
+            count: None,
+            selected_register: None,
+            macro_recording: None,
+            macro_replaying: Vec::new(),
+            last_theme: None,
+            theme,
+            last_selection: None,
+            status_msg: None,
+            autoinfo: None,
+            last_motion: None,
+            last_completion: None,
+            last_cwd: None,
+            dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
+            exit_code: 0,
+            mouse_down_range: None,
+            cursor_cache: CursorCache::default(),
+            cwd: Some(cwd),
+            env: Some(env),
+        }
+    }
+
+    /// Exchanges this state with the active client's.
+    fn swap(&mut self, editor: &mut Editor) {
+        use std::mem::swap;
+        swap(&mut self.mode, &mut editor.mode);
+        swap(&mut self.count, &mut editor.count);
+        swap(&mut self.selected_register, &mut editor.selected_register);
+        swap(&mut self.macro_recording, &mut editor.macro_recording);
+        swap(&mut self.macro_replaying, &mut editor.macro_replaying);
+        swap(&mut self.last_theme, &mut editor.last_theme);
+        swap(&mut self.theme, &mut editor.theme);
+        swap(&mut self.last_selection, &mut editor.last_selection);
+        swap(&mut self.status_msg, &mut editor.status_msg);
+        swap(&mut self.autoinfo, &mut editor.autoinfo);
+        swap(&mut self.last_motion, &mut editor.last_motion);
+        swap(&mut self.last_completion, &mut editor.last_completion);
+        swap(&mut self.last_cwd, &mut editor.last_cwd);
+        swap(&mut self.dir_stack, &mut editor.dir_stack);
+        swap(&mut self.exit_code, &mut editor.exit_code);
+        swap(&mut self.mouse_down_range, &mut editor.mouse_down_range);
+        swap(&mut self.cursor_cache, &mut editor.cursor_cache);
+        self.cwd = helix_stdx::env::swap_current_working_dir(self.cwd.take());
+        self.env = helix_stdx::env::swap_environment(self.env.take());
+    }
 }
 
 #[derive(Default)]
@@ -1612,6 +1704,82 @@ impl Editor {
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
             workspace_trust,
             file_watcher,
+            parked_clients: HashMap::new(),
+        }
+    }
+
+    /// The client whose state is in the editor's fields, and whose layout the tree uses.
+    pub fn active_client(&self) -> ClientId {
+        self.tree.active_client()
+    }
+
+    /// Every client, the active one first.
+    pub fn clients(&self) -> impl Iterator<Item = ClientId> + '_ {
+        self.tree.clients()
+    }
+
+    /// Whether `doc` goes with the active client when it leaves: no other client has it open,
+    /// and the active one does or is the last. A document that no client has open stays for
+    /// the clients that remain.
+    pub fn leaves_with_active_client(&self, doc: &Document) -> bool {
+        let active = self.active_client();
+        if doc.selections().is_empty() {
+            return self.clients().all(|client| client == active);
+        }
+        doc.selections()
+            .keys()
+            .all(|&view| self.tree.client_of(view) == active)
+    }
+
+    /// Adds a client with an empty layout. It stays inactive until [`Editor::activate`].
+    pub fn add_client(&mut self, client: ClientId, area: Rect, state: ClientState) {
+        self.tree.add_client(client, area);
+        self.parked_clients.insert(client, state);
+    }
+
+    /// Removes an inactive client, closing its views.
+    pub fn remove_client(&mut self, client: ClientId) {
+        for view in self.tree.client_views(client) {
+            self.close(view);
+        }
+        self.tree.remove_client(client);
+        self.parked_clients.remove(&client);
+        self.share_highlight_scopes();
+    }
+
+    /// Makes `client` the active one: swaps its state into the editor's fields and its layout
+    /// into the tree. Only the event loop and the callback dispatcher should call this, so that
+    /// work always runs as the client that caused it.
+    pub fn activate(&mut self, client: ClientId) {
+        let active = self.active_client();
+        if client == active {
+            return;
+        }
+        let mut state = self
+            .parked_clients
+            .remove(&client)
+            .expect("client has state");
+        state.swap(self);
+        self.parked_clients.insert(active, state);
+        self.tree.activate(client);
+    }
+
+    /// Gives every client's theme the same highlight scopes, those of the shared syntax loader,
+    /// so that its highlights mean the same whichever client draws them.
+    fn share_highlight_scopes(&mut self) {
+        let parked = self.parked_clients.values();
+        let scopes = theme::shared_scopes(
+            std::iter::once(&self.theme).chain(parked.map(|state| &state.theme)),
+        );
+        let loader = (*self.syn_loader).load();
+        if **loader.scopes() != scopes {
+            loader.set_scopes(scopes.clone());
+        }
+        let parked = self.parked_clients.values_mut();
+        for theme in std::iter::once(&mut self.theme).chain(parked.map(|state| &mut state.theme)) {
+            if theme.scopes() != scopes {
+                theme.index_scopes(scopes.clone());
+            }
         }
     }
 
@@ -1736,9 +1904,6 @@ impl Editor {
             bail!("Invalid theme: `ui.selection` required");
         }
 
-        let scopes = theme.scopes();
-        (*self.syn_loader).load().set_scopes(scopes.to_vec());
-
         match preview {
             ThemeAction::Preview => {
                 let last_theme = std::mem::replace(&mut self.theme, theme);
@@ -1750,6 +1915,7 @@ impl Editor {
                 self.theme = theme;
             }
         }
+        self.share_highlight_scopes();
 
         self._refresh();
         self.config_events.0.send(ConfigEvent::ThemeChanged)?;
@@ -2240,8 +2406,12 @@ impl Editor {
         )
     }
 
-    pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
-        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+    pub fn new_file_from_stdin(
+        &mut self,
+        stdin: &mut dyn io::Read,
+        action: Action,
+    ) -> Result<DocumentId, Error> {
+        let (stdin, encoding, has_bom) = crate::document::read_to_string(stdin, None)?;
         let doc = Document::from(
             helix_core::Rope::default(),
             Some((encoding, has_bom)),
@@ -2372,10 +2542,10 @@ impl Editor {
         let doc = self.documents.remove(&doc_id).unwrap();
         self.watch_open_files();
 
-        // If the document we removed was visible in all views, we will have no more views. We don't
-        // want to close the editor just for a simple buffer close, so we need to create a new view
-        // containing either an existing document, or a brand new document.
-        if self.tree.views().next().is_none() {
+        // If the document we removed was visible in all of a client's views, it will have no more
+        // views. We don't want to close a client just for a simple buffer close, so we need to
+        // create a new view containing either an existing document, or a brand new document.
+        for client in self.tree.empty_clients().collect::<Vec<_>>() {
             let doc_id = self
                 .documents
                 .iter()
@@ -2388,7 +2558,7 @@ impl Editor {
                     ))
                 });
             let view = View::new(doc_id, self.config().gutters.clone());
-            let view_id = self.tree.insert(view);
+            let view_id = self.tree.insert_into(client, view);
             let doc = doc_mut!(self, &doc_id);
             doc.ensure_view_init(view_id);
             doc.mark_as_focused();

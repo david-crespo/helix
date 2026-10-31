@@ -62,6 +62,10 @@ FLAGS:
     --vsplit                       Split all given files vertically into different windows
     --hsplit                       Split all given files horizontally into different windows
     -w, --working-dir <path>       Specify an initial working directory
+    -s, --session <name>           Join the editor shared under this name, starting it if needed
+    --no-session                   Run a separate editor instead of joining the session
+    --remote                       Open the files in the session's last used terminal and exit
+    --wait                         With --remote, exit once none of the files is shown
     +[N]                           Open the first given file at line number N, or the last line, if
                                    N is not specified.
 ",
@@ -136,6 +140,13 @@ FLAGS:
         }
     };
 
+    #[cfg(all(unix, not(feature = "integration")))]
+    if args.session_server.is_none() {
+        if let Some(key) = helix_term::session::session_key(&args, &config) {
+            return helix_term::session::run_client(&key, &args);
+        }
+    }
+
     let workspace_trust =
         helix_loader::workspace_trust::WorkspaceTrust::new((&config.editor.workspace_trust).into());
 
@@ -148,6 +159,11 @@ FLAGS:
             let _ = std::io::stdin().read(&mut []);
             helix_core::config::default_lang_loader()
         });
+
+    #[cfg(all(unix, not(feature = "integration")))]
+    if let Some(key) = &args.session_server {
+        return helix_term::application::serve(key, config, lang_loader, workspace_trust).await;
+    }
 
     // TODO: use the thread local executor to spawn the application task separately from the work pool
     let mut app = Application::new(args, config, lang_loader, workspace_trust)

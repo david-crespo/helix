@@ -33,6 +33,8 @@
 | `:quit-all!`, `:qa!` | Force close all views ignoring unsaved changes. |
 | `:cquit`, `:cq` | Quit with exit code (default 1). Accepts an optional integer exit code (:cq 2). |
 | `:cquit!`, `:cq!` | Force quit with exit code (default 1) ignoring unsaved changes. Accepts an optional integer exit code (:cq! 2). |
+| `:session-quit` | Close every client sharing this editor, ending the session. |
+| `:session-quit!` | Force close every client sharing this editor ignoring unsaved changes, ending the session. |
 | `:theme` | Change the editor theme (show current theme if no name specified). |
 | `:yank-join` | Yank joined selections. A separator can be provided as first argument. Default value is newline. |
 | `:clipboard-yank` | Yank main selection into system clipboard. |

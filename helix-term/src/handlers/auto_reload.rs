@@ -1,11 +1,11 @@
 use std::borrow::Cow;
-use std::io;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use helix_core::file_watcher::{events_from_paths, EventType, FileSystemDidChange};
+use helix_core::file_watcher::{events_from_paths, Event, EventType, FileSystemDidChange};
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_loader::workspace_trust::TrustQuery;
 use helix_view::editor::Config;
@@ -47,27 +47,38 @@ impl ReloadHandler {
         if !self.enable.load(atomic::Ordering::Relaxed) {
             return;
         }
-        let fs_events = event.fs_events.clone();
-        if !fs_events
+        // A file deleted and recreated in separate settle windows (some VCS
+        // operations) is reported as created, not modified.
+        let fs_events: Vec<Event> = event
+            .fs_events
             .iter()
-            .any(|event| event.ty == EventType::Modified)
-        {
+            .filter(|event| matches!(event.ty, EventType::Modified | EventType::Create))
+            .cloned()
+            .collect();
+        if fs_events.is_empty() {
             return;
         }
         let prompt_if_modified = self.prompt_if_modified.load(atomic::Ordering::Relaxed);
         job::dispatch_blocking(move |editor, compositor| {
-            let mut vcs_reload = false;
+            let vcs_reload = fs_events
+                .iter()
+                .any(|fs_event| editor.diff_providers.needs_reload(fs_event));
 
-            for fs_event in &*fs_events {
-                if fs_event.ty != EventType::Modified {
-                    continue;
-                }
-                vcs_reload |= editor.diff_providers.needs_reload(fs_event);
-
-                let Some(doc_id) = editor.document_id_by_path(fs_event.path.as_std_path()) else {
-                    continue;
-                };
-
+            // Event paths have symlinks resolved, document paths don't.
+            let changed: HashSet<&Path> = fs_events
+                .iter()
+                .map(|fs_event| fs_event.path.as_std_path())
+                .collect();
+            let doc_ids: Vec<_> = editor
+                .documents()
+                .filter(|doc| {
+                    doc.path()
+                        .and_then(|path| path.canonicalize().ok())
+                        .is_some_and(|path| changed.contains(path.as_path()))
+                })
+                .map(|doc| doc.id())
+                .collect();
+            for doc_id in doc_ids {
                 handle_document_change(editor, compositor, doc_id, prompt_if_modified);
             }
 
@@ -96,11 +107,14 @@ impl helix_event::AsyncHook for PollHandler {
     fn handle_event(
         &mut self,
         event: Self::Event,
-        _existing_debounce: Option<Instant>,
+        existing_debounce: Option<Instant>,
     ) -> Option<Instant> {
         match event {
+            // The sooner of this and a poll already scheduled, so a config change
+            // never puts one off.
             AutoReloadEvent::PollAfter { interval } => {
-                Some(Instant::now() + Duration::from_millis(interval))
+                let next = Instant::now() + Duration::from_millis(interval);
+                Some(existing_debounce.map_or(next, |existing| existing.min(next)))
             }
         }
     }
@@ -111,8 +125,6 @@ impl helix_event::AsyncHook for PollHandler {
             if !config.auto_reload.enable || !config.auto_reload.poll.enable {
                 return;
             }
-
-            let poll_interval = config.auto_reload.poll.interval;
 
             // Check unwatched documents for external modifications
             let modified_paths = changed_unwatched_paths(editor);
@@ -130,13 +142,7 @@ impl helix_event::AsyncHook for PollHandler {
                 dispatch(FileSystemDidChange { fs_events: events });
             }
 
-            // Schedule next poll
-            send_blocking(
-                &editor.handlers.auto_reload,
-                AutoReloadEvent::PollAfter {
-                    interval: poll_interval,
-                },
-            );
+            schedule_poll(&editor.handlers, &editor.config());
         });
     }
 }
@@ -173,6 +179,8 @@ pub(crate) fn on_focus_gained(editor: &Editor) {
     }
 }
 
+const SETTLE: Duration = Duration::from_millis(150);
+
 /// Handler for document changes detected by filesentry or polling
 fn handle_document_change(
     editor: &mut Editor,
@@ -189,13 +197,35 @@ fn handle_document_change(
         return;
     };
 
-    let mtime = match path.metadata() {
-        Ok(meta) => meta.modified().unwrap_or(SystemTime::now()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
-        Err(_) => SystemTime::now(),
+    let Ok(mtime) = path.metadata().and_then(|meta| meta.modified()) else {
+        return;
     };
 
     if mtime == doc.last_saved_time {
+        return;
+    }
+
+    // A writer that isn't atomic leaves the file briefly empty or partial: a jj
+    // checkout truncates the file, then writes the contents. The watcher's
+    // debounce doesn't cover the poll and focus checks, so leave a file written
+    // within `SETTLE` for a check once it has settled.
+    if SystemTime::now()
+        .duration_since(mtime)
+        .is_ok_and(|age| age < SETTLE)
+    {
+        log::info!(
+            "auto-reload: {} was just written, waiting for it to settle",
+            path.display()
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(SETTLE).await;
+            job::dispatch(move |editor, compositor| {
+                if editor.documents.contains_key(&doc_id) {
+                    handle_document_change(editor, compositor, doc_id, prompt_if_modified);
+                }
+            })
+            .await;
+        });
         return;
     }
 
@@ -308,6 +338,9 @@ pub(super) fn register_hooks(handlers: &Handlers, config: &Config) {
     let handler_ = handler.clone();
     register_hook!(move |event: &mut ConfigDidChange<'_>| {
         handler_.refresh_config(event.new);
+        // A shorter interval applies now rather than after the poll already
+        // scheduled, and turning polling back on restarts it.
+        schedule_poll(&event.editor.handlers, event.new);
         Ok(())
     });
     register_hook!(move |event: &mut FileSystemDidChange| {
@@ -315,7 +348,10 @@ pub(super) fn register_hooks(handlers: &Handlers, config: &Config) {
         Ok(())
     });
 
-    // Start polling if enabled
+    schedule_poll(handlers, config);
+}
+
+fn schedule_poll(handlers: &Handlers, config: &Config) {
     if config.auto_reload.enable && config.auto_reload.poll.enable {
         send_blocking(
             &handlers.auto_reload,

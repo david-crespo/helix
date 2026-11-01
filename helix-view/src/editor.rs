@@ -1945,7 +1945,15 @@ impl Editor {
         doc.language_servers.clear();
         doc.set_path(Some(path));
         doc.detect_editor_config();
-        self.refresh_doc_language(doc_id)
+        self.refresh_doc_language(doc_id);
+        self.watch_open_files();
+    }
+
+    /// Tells the file watcher which files are open, to watch the ones outside
+    /// the workspace or in ignored directories too.
+    fn watch_open_files(&mut self) {
+        let paths = self.documents.values().filter_map(|doc| doc.path());
+        self.file_watcher.set_open_files(paths);
     }
 
     pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
@@ -2282,6 +2290,7 @@ impl Editor {
 
             let id = self.new_document(doc);
             self.launch_language_servers(id);
+            self.watch_open_files();
 
             helix_event::dispatch(DocumentDidOpen {
                 editor: self,
@@ -2354,6 +2363,7 @@ impl Editor {
         }
 
         let doc = self.documents.remove(&doc_id).unwrap();
+        self.watch_open_files();
 
         // If the document we removed was visible in all views, we will have no more views. We don't
         // want to close the editor just for a simple buffer close, so we need to create a new view

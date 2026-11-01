@@ -1338,6 +1338,9 @@ impl Document {
         // This is not considered a modification of the contents of the file regardless
         // of the encoding.
         let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
+        // An unfinished insert goes into the history first, so that undo takes back the reload
+        // alone.
+        self.append_changes_to_history(view);
         self.apply(&transaction, view.id);
         self.append_changes_to_history(view);
         self.reset_modified();

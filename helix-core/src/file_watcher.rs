@@ -1,4 +1,6 @@
 use std::borrow::Borrow;
+use std::collections::{BTreeSet, HashSet};
+use std::iter;
 use std::mem::replace;
 use std::path::{Path, PathBuf};
 use std::slice;
@@ -47,8 +49,9 @@ pub struct Config {
     ///
     /// Defaults to `true`
     pub require_workspace: bool,
-    /// Enables ignoring hidden files.
-    /// Whether to hide hidden files in file picker and global search results. Defaults to true.
+    /// Ignore hidden files and directories, other than .helix, .github, .cargo
+    /// and .envrc, as the file picker's `hidden` does. Defaults to false, so
+    /// dotfiles like .eslintrc stay watched.
     pub hidden: bool,
     /// Enables reading `.ignore` files.
     /// Whether to hide files listed in .ignore in file picker and global search results. Defaults to true.
@@ -64,6 +67,13 @@ pub struct Config {
     // pub git_exclude: bool,
     /// Maximum Depth to recurse for filewatching
     pub max_depth: Option<usize>,
+    /// Also watch the files open in the editor that the workspace watch skips:
+    /// outside the workspace, or in an ignored or hidden directory. Watches each
+    /// one's directory, not recursively, so they don't have to be polled. Applies
+    /// outside a workspace too when `require-workspace` is set.
+    ///
+    /// Defaults to `true`
+    pub watch_open_files: bool,
 }
 
 impl Default for Config {
@@ -72,11 +82,12 @@ impl Default for Config {
             enable: true,
             watch_vcs: true,
             require_workspace: true,
-            hidden: true,
+            hidden: false,
             ignore: true,
             git_ignore: true,
             git_global: true,
             max_depth: Some(10),
+            watch_open_files: true,
         }
     }
 }
@@ -89,6 +100,11 @@ pub struct Watcher {
     /// Extra paths that need polling (e.g., VCS HEAD files outside workspace)
     /// Stored with their last known mtime for change detection
     extra_watched_paths: Vec<(PathBuf, Option<SystemTime>)>,
+    /// Real paths of the files open in the editor
+    open_files: BTreeSet<PathBuf>,
+    /// Roots given to filesentry, and whether recursively: it can't remove one,
+    /// and logs an error when one is added again
+    added_roots: HashSet<(PathBuf, bool)>,
 }
 
 impl Watcher {
@@ -99,12 +115,16 @@ impl Watcher {
                 filesentry_ignores: Gitignore::empty(),
                 ignore_files: Vec::new(),
                 global_ignores: Vec::new(),
-                hidden: true,
+                hidden: false,
                 watch_vcs: true,
+                open_files: HashSet::new(),
+                open_dirs: HashSet::new(),
             }),
             roots: Vec::new(),
             config: config.clone(),
             extra_watched_paths: Vec::new(),
+            open_files: BTreeSet::new(),
+            added_roots: HashSet::new(),
         };
         watcher.reload(config);
         watcher
@@ -112,22 +132,17 @@ impl Watcher {
 
     pub fn reload(&mut self, config: &Config) {
         let old_config = replace(&mut self.config, config.clone());
-        let (workspace, no_workspace) = helix_loader::find_workspace();
+        let watch_roots = self.watch_roots();
 
-        if !config.enable || config.require_workspace && no_workspace {
+        if !config.enable || !watch_roots && !config.watch_open_files {
             self.watcher = None;
             return;
         }
-        self.filter = Arc::new(WatchFilter::new(
-            config,
-            &workspace,
-            self.roots.iter().map(|(it, _)| &**it),
-        ));
-        let watcher = match &mut self.watcher {
+        self.filter = Arc::new(self.build_filter());
+        match &self.watcher {
             Some((watcher, _)) => {
                 // TODO: more fine grained detection of when recrawl is nedded
                 watcher.set_filter(self.filter.clone(), old_config != self.config);
-                watcher
             }
             None => match filesentry::Watcher::new() {
                 Ok(watcher) => {
@@ -141,24 +156,79 @@ impl Watcher {
                         dispatch(FileSystemDidChange { fs_events: events });
                         true
                     });
+                    watcher.start();
                     let shutdown_guard = watcher.shutdown_guard();
-                    &mut self.watcher.insert((watcher, shutdown_guard)).0
+                    self.watcher = Some((watcher, shutdown_guard));
+                    self.added_roots.clear();
                 }
                 Err(err) => {
                     log::info!("file-watcher not available: {err}");
                     return;
                 }
             },
-        };
-        if let Err(err) = watcher.add_root(&workspace, true, |_| ()) {
-            log::error!("failed to start file-watcher: {err}");
         }
-        for (root, _) in &self.roots {
-            if let Err(err) = watcher.add_root(root, true, |_| ()) {
-                log::error!("failed to start file-watcher: {err}");
+        self.add_roots();
+    }
+
+    /// Gives filesentry the roots it doesn't have yet: the workspace and the
+    /// roots added to it, and the directories of open files they don't cover.
+    fn add_roots(&mut self) {
+        let watch_roots = self.watch_roots();
+        let Some((watcher, _)) = &self.watcher else {
+            return;
+        };
+        let (workspace, _) = helix_loader::find_workspace();
+        let roots = iter::once(&workspace)
+            .chain(self.roots.iter().map(|(root, _)| root))
+            .filter(|_| watch_roots)
+            .map(|root| (root, true));
+        let open_dirs = self.filter.open_dirs.iter().map(|dir| (dir, false));
+        for (root, recursive) in roots.chain(open_dirs) {
+            if self.added_roots.insert((root.clone(), recursive)) {
+                if let Err(err) = watcher.add_root(root, recursive, |_| ()) {
+                    log::error!("failed to watch {root:?}: {err}");
+                }
             }
         }
-        watcher.start();
+    }
+
+    /// Whether to watch the workspace and the roots added to it. Without a
+    /// workspace, `require-workspace` leaves only the open files watched.
+    fn watch_roots(&self) -> bool {
+        !self.config.require_workspace || !helix_loader::find_workspace().1
+    }
+
+    fn build_filter(&self) -> WatchFilter {
+        let (workspace, _) = helix_loader::find_workspace();
+        let watch_roots = self.watch_roots();
+        let roots = self.roots.iter().map(|(root, _)| &**root);
+        let filter = WatchFilter::new(
+            &self.config,
+            &workspace,
+            roots.chain([&*workspace]).filter(|_| watch_roots),
+        );
+        let open_files = self
+            .open_files
+            .iter()
+            .filter(|_| self.config.watch_open_files);
+        filter.with_open_files(open_files)
+    }
+
+    /// Sets the files open in the editor, to watch the ones the roots don't.
+    pub fn set_open_files(&mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) {
+        let open_files: BTreeSet<_> = paths
+            .into_iter()
+            .filter_map(|path| real_path(path.as_ref()))
+            .collect();
+        if open_files == self.open_files {
+            return;
+        }
+        self.open_files = open_files;
+        if let Some((watcher, _)) = &self.watcher {
+            self.filter = Arc::new(self.build_filter());
+            watcher.set_filter(self.filter.clone(), false);
+            self.add_roots();
+        }
     }
 
     pub fn remove_root(&mut self, root: PathBuf) {
@@ -179,28 +249,13 @@ impl Watcher {
         self.watcher.is_some()
     }
 
-    /// Check if a given path is being actively watched.
-    /// Returns true if the path is under a watched root and not filtered out.
+    /// Check if a given path is being actively watched: an open file, or under a
+    /// watched root and not filtered out.
     pub fn is_watching(&self, path: &Path) -> bool {
-        if self.watcher.is_none() {
-            return false;
-        }
-        let path = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        let (workspace, _) = helix_loader::find_workspace();
-        // Check if under workspace and not filtered
-        if path.starts_with(&workspace) && !self.filter.ignore_path_rec(&path, Some(false)) {
-            return true;
-        }
-        // Check if under any explicitly added root and not filtered
-        for (root, _) in &self.roots {
-            if path.starts_with(root) && !self.filter.ignore_path_rec(&path, Some(false)) {
-                return true;
-            }
-        }
-        false
+        self.watcher.is_some()
+            && path
+                .canonicalize()
+                .is_ok_and(|path| !self.filter.ignore_path_rec(&path, Some(false)))
     }
 
     /// Poll extra watched paths for changes and return paths that have changed.
@@ -274,18 +329,20 @@ impl Watcher {
             return;
         }
         self.roots.insert(i, (root.clone(), 1));
-        self.filter = Arc::new(WatchFilter::new(
-            &self.config,
-            &workspace,
-            self.roots.iter().map(|(it, _)| &**it),
-        ));
+        self.filter = Arc::new(self.build_filter());
         if let Some((watcher, _)) = &self.watcher {
             watcher.set_filter(self.filter.clone(), false);
-            if let Err(err) = watcher.add_root(&root, true, |_| ()) {
-                log::error!("failed to watch {root:?}: {err}");
-            }
         }
+        self.add_roots();
     }
+}
+
+/// The real path of a file, or for one not written yet, of its directory
+/// joined with its name.
+fn real_path(path: &Path) -> Option<PathBuf> {
+    path.canonicalize()
+        .ok()
+        .or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)))
 }
 
 fn build_ignore(paths: impl IntoIterator<Item = PathBuf> + Clone, dir: &Path) -> Option<Gitignore> {
@@ -452,6 +509,11 @@ struct WatchFilter {
     global_ignores: Vec<Arc<Gitignore>>,
     hidden: bool,
     watch_vcs: bool,
+    /// Open files the roots don't cover
+    open_files: HashSet<PathBuf>,
+    /// Their directories, where the roots don't cover those either. Each is
+    /// watched without recursing, and lets through only the open files in it.
+    open_dirs: HashSet<PathBuf>,
 }
 
 impl WatchFilter {
@@ -463,7 +525,6 @@ impl WatchFilter {
         let filesentry_ignores = IgnoreFiles::filesentry_ignores(workspace);
         let (global_ignores, workspace_ignore) = IgnoreFiles::shared_ignores(workspace, config);
         let ignore_files = roots
-            .chain([workspace])
             .map(|root| IgnoreFiles::new(workspace_ignore.clone(), config, root, &global_ignores))
             .collect();
         WatchFilter {
@@ -472,7 +533,50 @@ impl WatchFilter {
             global_ignores,
             hidden: config.hidden,
             watch_vcs: config.watch_vcs,
+            open_files: HashSet::new(),
+            open_dirs: HashSet::new(),
         }
+    }
+
+    fn with_open_files<'a>(mut self, files: impl Iterator<Item = &'a PathBuf>) -> Self {
+        for file in files {
+            if self.covers(file, Some(false)) {
+                continue;
+            }
+            if let Some(dir) = file.parent().filter(|dir| !self.covers(dir, Some(true))) {
+                self.open_dirs.insert(dir.to_owned());
+            }
+            self.open_files.insert(file.clone());
+        }
+        self
+    }
+
+    fn is_open(&self, path: &Path) -> bool {
+        self.open_files.contains(path) || self.open_dirs.contains(path)
+    }
+
+    /// Whether the root watches cover `path`: it's under a root and not ignored.
+    fn covers(&self, mut path: &Path, mut is_dir: Option<bool>) -> bool {
+        let Some((root, ignore_files)) = self.ignore_files_for(path) else {
+            return false;
+        };
+        loop {
+            if path == root {
+                return true;
+            }
+            if self.ignore_path_impl(path, is_dir, ignore_files) {
+                return false;
+            }
+            let Some(parent) = path.parent() else {
+                break;
+            };
+            path = parent;
+            // Ancestors of the leaf are always directories. Passing the leaf's
+            // `is_dir` up the chain makes a dir-only pattern (gitignore `target/`)
+            // miss the ancestor directory it names.
+            is_dir = Some(true);
+        }
+        true
     }
 
     fn ignore_path_impl(
@@ -499,54 +603,41 @@ impl WatchFilter {
         if is_vcs_ignore(path, self.watch_vcs) {
             return true;
         }
-        !self.hidden && is_hidden(path)
+        self.hidden && is_hidden(path)
+    }
+
+    /// The nearest root `path` is under, and its ignore files
+    fn ignore_files_for(&self, path: &Path) -> Option<(&Path, &[Arc<Gitignore>])> {
+        self.ignore_files
+            .iter()
+            .filter(|files| path.starts_with(&files.root))
+            .max_by_key(|files| files.root.components().count())
+            .map(|files| (files.root.as_path(), files.ignores.as_slice()))
     }
 }
 
 impl filesentry::Filter for WatchFilter {
     fn ignore_path(&self, path: &Path, is_dir: Option<bool>) -> bool {
-        let i = self
-            .ignore_files
-            .partition_point(|ignore_files| path < ignore_files.root);
+        if self.is_open(path) {
+            return false;
+        }
+        if path
+            .parent()
+            .is_some_and(|dir| self.open_dirs.contains(dir))
+        {
+            return !self.covers(path, is_dir);
+        }
         let (root, ignore_files) = self
-            .ignore_files
-            .get(i)
-            .map_or((Path::new(""), &self.global_ignores), |files| {
-                (&files.root, &files.ignores)
-            });
+            .ignore_files_for(path)
+            .unwrap_or((Path::new(""), &self.global_ignores));
         if path == root {
             return false;
         }
         self.ignore_path_impl(path, is_dir, ignore_files)
     }
 
-    fn ignore_path_rec(&self, mut path: &Path, mut is_dir: Option<bool>) -> bool {
-        let i = self
-            .ignore_files
-            .partition_point(|ignore_files| path < ignore_files.root);
-        let (root, ignore_files) = self
-            .ignore_files
-            .get(i)
-            .map_or((Path::new(""), &self.global_ignores), |files| {
-                (&files.root, &files.ignores)
-            });
-        loop {
-            if path == root {
-                return false;
-            }
-            if self.ignore_path_impl(path, is_dir, ignore_files) {
-                return true;
-            }
-            let Some(parent) = path.parent() else {
-                break;
-            };
-            path = parent;
-            // Ancestors of the leaf are always directories. Passing the leaf's
-            // `is_dir` up the chain makes a dir-only pattern (gitignore `target/`)
-            // miss the ancestor directory it names.
-            is_dir = Some(true);
-        }
-        false
+    fn ignore_path_rec(&self, path: &Path, is_dir: Option<bool>) -> bool {
+        !self.is_open(path) && !self.covers(path, is_dir)
     }
 }
 
@@ -595,6 +686,7 @@ fn is_vcs_ignore(path: &Path, watch_vcs: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::Path;
 
     use crate::file_watcher::{is_hardcoded_whitelist, is_hidden, is_vcs_ignore};
@@ -650,6 +742,8 @@ mod tests {
             global_ignores: Vec::new(),
             hidden: true,
             watch_vcs: true,
+            open_files: HashSet::new(),
+            open_dirs: HashSet::new(),
         };
 
         // A file under `target/` is ignored even though the leaf is passed as a file:
@@ -657,5 +751,143 @@ mod tests {
         assert!(filter.ignore_path_rec(Path::new("/repo/target/foo.rs"), Some(false)));
         assert!(filter.ignore_path_rec(Path::new("/repo/target/deep/foo.rs"), Some(false)));
         assert!(!filter.ignore_path_rec(Path::new("/repo/src/main.rs"), Some(false)));
+    }
+
+    #[test]
+    fn watches_open_files_the_roots_skip() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use filesentry::Filter;
+        use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+        use crate::file_watcher::{IgnoreFiles, WatchFilter};
+
+        let mut builder = GitignoreBuilder::new("/repo");
+        builder.add_line(None, "notes/").unwrap();
+        builder.add_line(None, "*.log").unwrap();
+        let filter = WatchFilter {
+            filesentry_ignores: Gitignore::empty(),
+            ignore_files: vec![IgnoreFiles {
+                root: "/repo".into(),
+                ignores: vec![Arc::new(builder.build().unwrap())],
+            }],
+            global_ignores: Vec::new(),
+            hidden: true,
+            watch_vcs: true,
+            open_files: HashSet::new(),
+            open_dirs: HashSet::new(),
+        };
+        let open: Vec<PathBuf> = [
+            "/repo/notes/a.md",
+            "/repo/notes/b.md",
+            "/repo/src/main.rs",
+            "/repo/src/debug.log",
+            "/elsewhere/c.md",
+        ]
+        .map(PathBuf::from)
+        .into();
+        let filter = filter.with_open_files(open.iter());
+        let ignored = |path: &str, is_dir| filter.ignore_path(Path::new(path), Some(is_dir));
+        let ignored_rec = |path: &str| filter.ignore_path_rec(Path::new(path), Some(false));
+
+        // Only the directories the roots skip get a watch of their own.
+        let dirs: HashSet<PathBuf> = ["/repo/notes", "/elsewhere"].map(PathBuf::from).into();
+        assert_eq!(filter.open_dirs, dirs);
+        assert!(!ignored("/repo/notes", true));
+        assert!(!ignored_rec("/elsewhere"));
+        // In those, only the open files get through.
+        assert!(!ignored_rec("/repo/notes/a.md"));
+        assert!(!ignored("/repo/notes/b.md", false));
+        assert!(ignored("/repo/notes/other.md", false));
+        assert!(ignored("/repo/notes/sub", true));
+        assert!(!ignored_rec("/elsewhere/c.md"));
+        assert!(ignored("/elsewhere/d.md", false));
+        assert!(ignored_rec("/elsewhere/sub/e.md"));
+        // An ignored open file in a watched directory gets through, and the
+        // root watch is otherwise unchanged.
+        assert!(!ignored("/repo/src/debug.log", false));
+        assert!(ignored("/repo/src/other.log", false));
+        assert!(!ignored("/repo/src/lib.rs", false));
+    }
+
+    /// Each path takes the ignore files of the root it's under, whatever order
+    /// the roots are in.
+    #[test]
+    fn ignore_files_of_the_root_a_path_is_under() {
+        use std::sync::Arc;
+
+        use filesentry::Filter;
+        use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+        use crate::file_watcher::{IgnoreFiles, WatchFilter};
+
+        let ignore_files = |root: &str, line: &str| {
+            let mut builder = GitignoreBuilder::new(root);
+            builder.add_line(None, line).unwrap();
+            IgnoreFiles {
+                root: root.into(),
+                ignores: vec![Arc::new(builder.build().unwrap())],
+            }
+        };
+        // LSP roots in order, then the workspace, as `Watcher` builds them
+        let filter = WatchFilter {
+            filesentry_ignores: Gitignore::empty(),
+            ignore_files: vec![
+                ignore_files("/a", "a-ignored"),
+                ignore_files("/b", "b-ignored"),
+                ignore_files("/w", "w-ignored"),
+            ],
+            global_ignores: Vec::new(),
+            hidden: false,
+            watch_vcs: true,
+            open_files: HashSet::new(),
+            open_dirs: HashSet::new(),
+        };
+        for root in ["/a", "/b", "/w"] {
+            let name = &root[1..];
+            let ignored = format!("{root}/{name}-ignored");
+            assert!(
+                filter.ignore_path(Path::new(&ignored), Some(false)),
+                "{ignored}"
+            );
+            assert!(
+                filter.ignore_path_rec(Path::new(&ignored), Some(false)),
+                "{ignored}"
+            );
+            let kept = format!("{root}/src/main.rs");
+            assert!(
+                !filter.ignore_path_rec(Path::new(&kept), Some(false)),
+                "{kept}"
+            );
+        }
+    }
+
+    /// `hidden` hides hidden files from the watcher, as it does in the file
+    /// picker. Off by default, so dotfiles like .eslintrc stay watched.
+    #[test]
+    fn hidden_ignores_hidden_files() {
+        use filesentry::Filter;
+        use ignore::gitignore::Gitignore;
+
+        use crate::file_watcher::{Config, WatchFilter};
+
+        assert!(!Config::default().hidden);
+        let filter = |hidden| WatchFilter {
+            filesentry_ignores: Gitignore::empty(),
+            ignore_files: Vec::new(),
+            global_ignores: Vec::new(),
+            hidden,
+            watch_vcs: true,
+            open_files: HashSet::new(),
+            open_dirs: HashSet::new(),
+        };
+        let path = Path::new("/repo/.eslintrc");
+        assert!(filter(true).ignore_path(path, Some(false)));
+        assert!(!filter(false).ignore_path(path, Some(false)));
+        // .helix and the VCS files stay watched either way
+        assert!(!filter(true).ignore_path(Path::new("/repo/.helix"), Some(true)));
+        assert!(!filter(true).ignore_path(Path::new("/repo/.git"), Some(true)));
+        assert!(!filter(true).ignore_path(Path::new("/repo/.git/HEAD"), Some(false)));
     }
 }

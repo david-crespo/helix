@@ -213,7 +213,7 @@ fn request_document_diagnostics_for_language_severs(
         return;
     }
 
-    tokio::spawn(async move {
+    helix_event::client::spawn(async move {
         let mut retry_language_servers = HashSet::new();
         loop {
             match cancelable_future(futures.next(), &cancel).await {

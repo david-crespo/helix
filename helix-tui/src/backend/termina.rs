@@ -1,4 +1,11 @@
-use std::io::{self, Write as _};
+use std::{
+    fs::File,
+    io::{self, Write},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
+};
 
 use helix_view::{
     editor::KittyKeyboardProtocolConfig,
@@ -84,6 +91,8 @@ pub struct TerminaBackend {
     /// Whether the terminal is set up for us. While it isn't, another process may be using it,
     /// so we leave it alone.
     claimed: bool,
+    /// What we write goes through this rather than straight to `terminal`, if set.
+    writer: Option<TerminalWriter>,
 }
 
 impl TerminaBackend {
@@ -245,6 +254,7 @@ impl TerminaBackend {
             background_color: None,
             original_background_color,
             claimed: false,
+            writer: None,
         })
     }
 
@@ -277,10 +287,37 @@ impl TerminaBackend {
         &self.terminal
     }
 
+    /// Writes through `writer` from now on, rather than straight to the terminal.
+    pub fn set_writer(&mut self, writer: TerminalWriter) {
+        self.writer = Some(writer);
+    }
+
+    /// Whether the terminal is behind on what was written to it, so drawing more now would
+    /// only add to what it has to catch up on.
+    pub fn is_behind(&self) -> bool {
+        self.writer.as_ref().is_some_and(TerminalWriter::is_behind)
+    }
+
+    /// Runs `f` once what was written so far has reached the terminal, or failed to.
+    pub fn then(&mut self, f: impl FnOnce() + Send + 'static) {
+        let _ = self.out().flush();
+        match &self.writer {
+            Some(writer) => writer.then(f),
+            None => f(),
+        }
+    }
+
+    fn out(&mut self) -> &mut dyn Write {
+        match &mut self.writer {
+            Some(writer) => writer,
+            None => &mut self.terminal,
+        }
+    }
+
     fn enable_mouse_capture(&mut self) -> io::Result<()> {
         if self.config.enable_mouse_capture {
             write!(
-                self.terminal,
+                self.out(),
                 "{}{}{}{}{}",
                 decset!(MouseTracking),
                 decset!(ButtonEventMouse),
@@ -298,7 +335,7 @@ impl TerminaBackend {
         // and then on exit the terminal is still capturing things.
         if self.config.enable_mouse_capture || cfg!(feature = "steel") {
             write!(
-                self.terminal,
+                self.out(),
                 "{}{}{}{}{}",
                 decreset!(MouseTracking),
                 decreset!(ButtonEventMouse),
@@ -311,17 +348,33 @@ impl TerminaBackend {
     }
 
     fn reset_background_color(&mut self) -> io::Result<()> {
+        let reset = match self.original_background_color {
+            Some(color) => Osc::ChangeDynamicColors(
+                osc::DynamicColorNumber::TextBackgroundColor,
+                vec![color.into()],
+            ),
+            None => Osc::ResetDynamicColor(osc::DynamicColorNumber::TextBackgroundColor),
+        };
+        write!(self.out(), "{reset}")
+    }
+
+    /// Undoes what claiming the terminal set up.
+    fn reset(&mut self) -> io::Result<()> {
+        self.disable_extensions()?;
+        self.disable_mouse_capture()?;
+        let reset_cursor = self.reset_cursor_command.clone();
         write!(
-            self.terminal,
-            "{}",
-            match self.original_background_color {
-                Some(color) => Osc::ChangeDynamicColors(
-                    osc::DynamicColorNumber::TextBackgroundColor,
-                    vec![color.into()]
-                ),
-                None => Osc::ResetDynamicColor(osc::DynamicColorNumber::TextBackgroundColor),
-            }
-        )
+            self.out(),
+            "{}{}{}{}",
+            &reset_cursor,
+            decreset!(BracketedPaste),
+            decreset!(FocusTracking),
+            decreset!(ClearAndEnableAlternateScreen),
+        )?;
+        if self.background_color.is_some() {
+            self.reset_background_color()?;
+        }
+        Ok(())
     }
 
     fn enable_extensions(&mut self) -> io::Result<()> {
@@ -333,14 +386,14 @@ impl TerminaBackend {
             KittyKeyboardSupport::None | KittyKeyboardSupport::Partial => (),
             KittyKeyboardSupport::Full => {
                 write!(
-                    self.terminal,
+                    self.out(),
                     "{}",
                     Csi::Keyboard(csi::Keyboard::PushFlags(KEYBOARD_FLAGS))
                 )?;
             }
             KittyKeyboardSupport::Some => {
                 write!(
-                    self.terminal,
+                    self.out(),
                     "{}{}",
                     // Enable the flags we need.
                     Csi::Keyboard(csi::Keyboard::PushFlags(KEYBOARD_FLAGS)),
@@ -348,7 +401,7 @@ impl TerminaBackend {
                     // all of the flags we require.
                     Csi::Keyboard(csi::Keyboard::QueryFlags),
                 )?;
-                self.terminal.flush()?;
+                self.out().flush()?;
 
                 let reports_flags = |event: &Event| {
                     matches!(
@@ -370,12 +423,8 @@ impl TerminaBackend {
                 };
                 if flags != Some(KEYBOARD_FLAGS) {
                     log::info!("Turning off enhanced keyboard support because the terminal enabled different flags. Requested {KEYBOARD_FLAGS:?} but got {flags:?}");
-                    write!(
-                        self.terminal,
-                        "{}",
-                        Csi::Keyboard(csi::Keyboard::PopFlags(1))
-                    )?;
-                    self.terminal.flush()?;
+                    write!(self.out(), "{}", Csi::Keyboard(csi::Keyboard::PopFlags(1)))?;
+                    self.out().flush()?;
                     self.capabilities.kitty_keyboard = KittyKeyboardSupport::Partial;
                 } else {
                     log::debug!(
@@ -388,7 +437,7 @@ impl TerminaBackend {
 
         if self.capabilities.theme_mode.is_some() {
             // Enable mode 2031 theme mode notifications:
-            write!(self.terminal, "{}", decset!(Theme))?;
+            write!(self.out(), "{}", decset!(Theme))?;
         }
 
         Ok(())
@@ -396,16 +445,12 @@ impl TerminaBackend {
 
     fn disable_extensions(&mut self) -> io::Result<()> {
         if self.capabilities.kitty_keyboard == KittyKeyboardSupport::Full {
-            write!(
-                self.terminal,
-                "{}",
-                Csi::Keyboard(csi::Keyboard::PopFlags(1))
-            )?;
+            write!(self.out(), "{}", Csi::Keyboard(csi::Keyboard::PopFlags(1)))?;
         }
 
         if self.capabilities.theme_mode.is_some() {
             // Mode 2031 theme notifications.
-            write!(self.terminal, "{}", decreset!(Theme))?;
+            write!(self.out(), "{}", decreset!(Theme))?;
         }
 
         Ok(())
@@ -419,7 +464,7 @@ impl TerminaBackend {
 
     fn start_synchronized_render(&mut self) -> io::Result<()> {
         if self.capabilities.synchronized_output && !self.is_synchronized_output_set {
-            write!(self.terminal, "{}", decset!(SynchronizedOutput))?;
+            write!(self.out(), "{}", decset!(SynchronizedOutput))?;
             self.is_synchronized_output_set = true;
         }
         Ok(())
@@ -427,7 +472,7 @@ impl TerminaBackend {
 
     fn end_sychronized_render(&mut self) -> io::Result<()> {
         if self.is_synchronized_output_set {
-            write!(self.terminal, "{}", decreset!(SynchronizedOutput))?;
+            write!(self.out(), "{}", decreset!(SynchronizedOutput))?;
             self.is_synchronized_output_set = false;
         }
         Ok(())
@@ -439,7 +484,7 @@ impl Backend for TerminaBackend {
         self.terminal.enter_raw_mode()?;
 
         write!(
-            self.terminal,
+            self.out(),
             "{}{}{}{}",
             // Enter an alternate screen.
             decset!(ClearAndEnableAlternateScreen),
@@ -451,7 +496,7 @@ impl Backend for TerminaBackend {
         )?;
         if let Some(color) = self.background_color {
             write!(
-                self.terminal,
+                self.out(),
                 "{}",
                 Osc::ChangeDynamicColors(
                     osc::DynamicColorNumber::TextBackgroundColor,
@@ -484,20 +529,8 @@ impl Backend for TerminaBackend {
             return Ok(());
         }
         self.claimed = false;
-        self.disable_extensions()?;
-        self.disable_mouse_capture()?;
-        write!(
-            self.terminal,
-            "{}{}{}{}",
-            &self.reset_cursor_command,
-            decreset!(BracketedPaste),
-            decreset!(FocusTracking),
-            decreset!(ClearAndEnableAlternateScreen),
-        )?;
-        if self.background_color.is_some() {
-            self.reset_background_color()?;
-        }
-        self.terminal.flush()?;
+        self.reset()?;
+        self.out().flush()?;
         self.terminal.enter_cooked_mode()?;
         Ok(())
     }
@@ -518,7 +551,7 @@ impl Backend for TerminaBackend {
             // Move the cursor if the previous location was not (x - 1, y)
             if !matches!(last_pos, Some(p) if x == p.0 + 1 && y == p.1) {
                 write!(
-                    self.terminal,
+                    self.out(),
                     "{}",
                     Csi::Cursor(csi::Cursor::Position {
                         col: OneBased::from_zero_based(x),
@@ -548,7 +581,7 @@ impl Backend for TerminaBackend {
             if self.capabilities.extended_underlines {
                 if cell.underline_color != underline_color {
                     write!(
-                        self.terminal,
+                        self.out(),
                         "{}",
                         Csi::Sgr(csi::Sgr::UnderlineColor(cell.underline_color.into()))
                     )?;
@@ -562,7 +595,7 @@ impl Backend for TerminaBackend {
             }
             if new_underline_style != underline_style {
                 write!(
-                    self.terminal,
+                    self.out(),
                     "{}",
                     Csi::Sgr(csi::Sgr::Underline(new_underline_style.into()))
                 )?;
@@ -573,17 +606,13 @@ impl Backend for TerminaBackend {
             // `SgrAttributes` behave the same as a `Sgr::Reset` rather than a 'no-op' though so
             // we should avoid writing them if they're empty.
             if !attributes.is_empty() {
-                write!(
-                    self.terminal,
-                    "{}",
-                    Csi::Sgr(csi::Sgr::Attributes(attributes))
-                )?;
+                write!(self.out(), "{}", Csi::Sgr(csi::Sgr::Attributes(attributes)))?;
             }
 
-            write!(self.terminal, "{}", &cell.symbol)?;
+            write!(self.out(), "{}", &cell.symbol)?;
         }
 
-        write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
+        write!(self.out(), "{}", Csi::Sgr(csi::Sgr::Reset))?;
 
         self.end_sychronized_render()?;
 
@@ -591,7 +620,7 @@ impl Backend for TerminaBackend {
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
-        write!(self.terminal, "{}", decreset!(ShowCursor))?;
+        write!(self.out(), "{}", decreset!(ShowCursor))?;
         self.flush()
     }
 
@@ -603,7 +632,7 @@ impl Backend for TerminaBackend {
             CursorKind::Hidden => unreachable!(),
         };
         write!(
-            self.terminal,
+            self.out(),
             "{}{}",
             decset!(ShowCursor),
             Csi::Cursor(csi::Cursor::CursorStyle(style)),
@@ -615,7 +644,7 @@ impl Backend for TerminaBackend {
         let col = OneBased::from_zero_based(x);
         let line = OneBased::from_zero_based(y);
         write!(
-            self.terminal,
+            self.out(),
             "{}",
             Csi::Cursor(csi::Cursor::Position { line, col })
         )?;
@@ -625,7 +654,7 @@ impl Backend for TerminaBackend {
     fn clear(&mut self) -> io::Result<()> {
         self.start_synchronized_render()?;
         write!(
-            self.terminal,
+            self.out(),
             "{}",
             Csi::Edit(csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseDisplay))
         )?;
@@ -638,7 +667,7 @@ impl Backend for TerminaBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.terminal.flush()
+        self.out().flush()
     }
 
     fn supports_true_color(&self) -> bool {
@@ -659,7 +688,7 @@ impl Backend for TerminaBackend {
         };
         if let Some(color) = self.background_color {
             write!(
-                self.terminal,
+                self.out(),
                 "{}",
                 Osc::ChangeDynamicColors(
                     osc::DynamicColorNumber::TextBackgroundColor,
@@ -677,19 +706,7 @@ impl Drop for TerminaBackend {
         // Avoid resetting the terminal while panicking because we set a panic hook above in
         // `Self::new`.
         if self.claimed && !std::thread::panicking() {
-            let _ = self.disable_extensions();
-            let _ = self.disable_mouse_capture();
-            let _ = write!(
-                self.terminal,
-                "{}{}{}{}",
-                &self.reset_cursor_command,
-                decreset!(BracketedPaste),
-                decreset!(FocusTracking),
-                decreset!(ClearAndEnableAlternateScreen),
-            );
-            if self.background_color.is_some() {
-                let _ = self.reset_background_color();
-            }
+            let _ = self.reset();
             // NOTE: Drop for Platform terminal resets the mode and flushes the buffer when not
             // panicking.
         }
@@ -752,4 +769,105 @@ fn diff_modifiers(from: Modifier, to: Modifier) -> SgrModifiers {
     }
 
     modifiers
+}
+
+/// Writes to a terminal from a thread of its own, so a terminal that stops taking output, like
+/// one over a stalled SSH connection, holds up only that thread. Writes are buffered until a
+/// flush hands them to the thread.
+#[derive(Debug)]
+pub struct TerminalWriter {
+    buffer: Vec<u8>,
+    queue: mpsc::Sender<Queued>,
+    /// How many bytes were handed to the thread but haven't been written yet.
+    backlog: Arc<AtomicUsize>,
+}
+
+enum Queued {
+    Bytes(Vec<u8>),
+    Then(Box<dyn FnOnce() + Send>),
+}
+
+impl TerminalWriter {
+    /// How far behind the terminal can be before [`Self::is_behind`]: about a full screen.
+    const MAX_BACKLOG: usize = 64 * 1024;
+
+    /// Starts writing to `terminal`. After the terminal has been behind, `caught_up` is called
+    /// once it isn't anymore.
+    pub fn new(mut terminal: File, caught_up: impl Fn() + Send + 'static) -> io::Result<Self> {
+        let (queue, queued) = mpsc::channel();
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let left = backlog.clone();
+        std::thread::Builder::new()
+            .name("terminal writer".into())
+            .spawn(move || {
+                let mut broken = false;
+                let mut behind = false;
+                for queued in queued {
+                    match queued {
+                        Queued::Bytes(bytes) => {
+                            // Once the terminal is gone, what's left is dropped.
+                            broken = broken || terminal.write_all(&bytes).is_err();
+                            let before = left.fetch_sub(bytes.len(), Ordering::SeqCst);
+                            behind |= before > Self::MAX_BACKLOG;
+                            if behind && before - bytes.len() <= Self::MAX_BACKLOG {
+                                behind = false;
+                                caught_up();
+                            }
+                        }
+                        Queued::Then(f) => f(),
+                    }
+                }
+            })?;
+        Ok(Self {
+            buffer: Vec::new(),
+            queue,
+            backlog,
+        })
+    }
+
+    fn is_behind(&self) -> bool {
+        self.backlog.load(Ordering::SeqCst) > Self::MAX_BACKLOG
+    }
+
+    /// Runs `f` on the writer's thread once what was flushed before has been written.
+    fn then(&self, f: impl FnOnce() + Send + 'static) {
+        if let Err(mpsc::SendError(Queued::Then(f))) = self.queue.send(Queued::Then(Box::new(f))) {
+            f();
+        }
+    }
+}
+
+/// Another handle on the same terminal and thread, with a buffer of its own.
+impl Clone for TerminalWriter {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: Vec::new(),
+            queue: self.queue.clone(),
+            backlog: self.backlog.clone(),
+        }
+    }
+}
+
+impl Write for TerminalWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::take(&mut self.buffer);
+        self.backlog.fetch_add(bytes.len(), Ordering::SeqCst);
+        self.queue
+            .send(Queued::Bytes(bytes))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+}
+
+impl Drop for TerminalWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
 }

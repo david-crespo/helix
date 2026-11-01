@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,7 +31,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_stream::StreamMap;
-use tui::backend::Backend as _;
+use tui::backend::{Backend as _, TerminalWriter};
 
 use super::{Application, ClientUi, Terminal, TerminalBackend, TerminalEvent};
 use crate::{
@@ -39,6 +39,8 @@ use crate::{
     commands::ScriptingEngine,
     compositor::Compositor,
     config::Config,
+    events::{ClientAttached, ClientDetached},
+    handlers,
     session::{self, ClientMessage, Hello, ServerMessage},
 };
 
@@ -83,7 +85,7 @@ impl Conn {
         stream.set_nonblocking(true)?;
         let (read, mut write) = tokio::net::UnixStream::from_std(stream)?.into_split();
         let (messages, mut queue) = unbounded_channel::<ServerMessage>();
-        let writer = tokio::spawn(async move {
+        let writer = helix_event::client::spawn(async move {
             while let Some(message) = queue.recv().await {
                 let sent = match session::frame(&message) {
                     Ok(frame) => write.write_all(&frame).await,
@@ -106,6 +108,17 @@ impl Conn {
         let _ = self.messages.send(message);
     }
 
+    /// Sends `messages` once what was drawn to `terminal` has reached it, so the client doesn't
+    /// take its terminal back before it's been reset.
+    fn send_after(&self, terminal: &mut Terminal, messages: Vec<ServerMessage>) {
+        let sender = self.messages.clone();
+        terminal.backend_mut().then(move || {
+            for message in messages {
+                let _ = sender.send(message);
+            }
+        });
+    }
+
     /// Waits for what was sent to go out, for at most a second.
     async fn close(self) {
         drop(self.messages);
@@ -119,6 +132,8 @@ pub struct NewClient {
     stdin: Option<Vec<u8>>,
     /// `None` for a `--remote` client.
     backend: Option<TerminalBackend>,
+    /// Another handle on the client's terminal, for clipboard copies sent as OSC 52.
+    clipboard: Option<Box<dyn Write + Send>>,
 }
 
 pub enum ServerEvent {
@@ -194,16 +209,25 @@ pub async fn serve(
     let app = (|| {
         let backend = client.backend.expect("a client with a terminal");
         helix_stdx::env::swap_environment(Some(environment(&client.hello)));
+        helix_view::clipboard::swap_terminal(client.clipboard);
         helix_stdx::env::set_current_working_dir(&client.hello.cwd)?;
+        let auto_save = client.hello.auto_save;
         let mut stdin = client.stdin.as_deref();
-        Application::with_backend(
+        let mut app = Application::with_backend(
             args(&client.hello),
             config,
             lang_loader,
             workspace_trust,
             backend,
             stdin.as_mut().map(|stdin| stdin as &mut dyn Read),
-        )
+        )?;
+        app.editor.registers.client_clipboard = Some(client.hello.clipboard_provider);
+        if let Some(delay) = auto_save {
+            app.editor
+                .client_auto_save
+                .insert(ClientId::default(), delay);
+        }
+        Ok(app)
     })();
     let mut app = match app {
         Ok(app) => app,
@@ -250,7 +274,19 @@ pub async fn serve(
     drop((socket, listener));
     let errors = app.close().await;
     ScriptingEngine::shutdown();
-    let mut exits = Vec::new();
+    let exit = |code| {
+        let mut messages: Vec<_> = errors
+            .iter()
+            .map(|err| ServerMessage::Error(format!("Error: {err}")))
+            .collect();
+        messages.push(ServerMessage::Exit(if errors.is_empty() {
+            code
+        } else {
+            1
+        }));
+        messages
+    };
+    let mut closing = Vec::new();
     for client in app.editor.clients().collect::<Vec<_>>() {
         app.activate(client);
         let _ = app.restore_term();
@@ -259,24 +295,18 @@ pub async fn serve(
             wait.code = code;
         }
         if let Some(conn) = conns.remove(&client) {
-            exits.push((conn, code));
+            conn.send_after(&mut app.terminal, exit(code));
+            closing.push(conn);
         }
     }
-    exits.extend(waits.into_iter().map(|wait| (wait.conn, wait.code)));
-    // Dropping the terminals resets them, which has to happen before the clients take them back.
+    for wait in waits {
+        exit(wait.code)
+            .into_iter()
+            .for_each(|message| wait.conn.send(message));
+        closing.push(wait.conn);
+    }
     drop(app);
-    let closing = exits.into_iter().map(|(conn, code)| {
-        for err in &errors {
-            conn.send(ServerMessage::Error(format!("Error: {err}")));
-        }
-        conn.send(ServerMessage::Exit(if errors.is_empty() {
-            code
-        } else {
-            1
-        }));
-        conn.close()
-    });
-    future::join_all(closing).await;
+    future::join_all(closing.into_iter().map(Conn::close)).await;
     Ok(0)
 }
 
@@ -318,21 +348,26 @@ fn bind(path: &Path) -> io::Result<Option<(UnixListener, Socket)>> {
 /// answering queries.
 fn attach_terminal(conn: &UnixStream, config: &Config) -> anyhow::Result<NewClient> {
     let attach = session::handshake(conn).context("handshake failed")?;
-    let backend = match attach.tty {
-        Some(tty) => {
-            let terminal = PlatformTerminal::from_fd(tty).context("can't use the terminal")?;
-            let backend =
-                TerminalBackend::with_terminal(terminal, (&config.editor).into(), &|name| {
-                    attach.hello.var(name)
-                });
-            Some(backend.context("can't set up the terminal")?)
-        }
-        None => None,
+    let Some(tty) = attach.tty else {
+        return Ok(NewClient {
+            hello: attach.hello,
+            stdin: attach.stdin,
+            backend: None,
+            clipboard: None,
+        });
     };
+    let writer = TerminalWriter::new(tty.try_clone()?.into(), helix_event::request_redraw)?;
+    let terminal = PlatformTerminal::from_fd(tty).context("can't use the terminal")?;
+    let mut backend = TerminalBackend::with_terminal(terminal, (&config.editor).into(), &|name| {
+        attach.hello.var(name)
+    })
+    .context("can't set up the terminal")?;
+    backend.set_writer(writer.clone());
     Ok(NewClient {
         hello: attach.hello,
         stdin: attach.stdin,
-        backend,
+        backend: Some(backend),
+        clipboard: Some(Box::new(writer)),
     })
 }
 
@@ -427,7 +462,7 @@ impl Server {
     fn handshake(&self, conn: tokio::net::UnixStream) {
         let attached = self.attached.0.clone();
         let config = self.config.load_full();
-        tokio::task::spawn_blocking(move || {
+        helix_event::client::spawn_blocking(move || {
             let Ok(conn) = conn
                 .into_std()
                 .and_then(|conn| conn.set_nonblocking(false).map(|()| conn))
@@ -442,7 +477,7 @@ impl Server {
     fn add(&mut self, client: ClientId, mut conn: Conn, events: termina::EventStream) {
         if let Some(mut read) = conn.read.take() {
             let messages = self.messages.0.clone();
-            tokio::spawn(async move {
+            helix_event::client::spawn(async move {
                 loop {
                     let message = session::read_message_async(&mut read).await.ok();
                     let closed = message.is_none();
@@ -490,6 +525,7 @@ impl Application {
             hello,
             stdin,
             backend,
+            clipboard,
         } = new;
         let Some(backend) = backend else {
             self.open_remote(conn, &hello);
@@ -499,7 +535,7 @@ impl Application {
         let server = self.server();
         let client = ClientId(server.next_client);
         server.next_client += 1;
-        if let Err(err) = self.add_client(client, &hello, stdin, backend) {
+        if let Err(err) = self.add_client(client, &hello, stdin, backend, clipboard) {
             self.detach(client);
             refuse(&conn, &err);
             return;
@@ -507,6 +543,10 @@ impl Application {
         let events = self.event_stream();
         self.server().add(client, conn, events);
         self.focused = client;
+        helix_event::dispatch(ClientAttached {
+            editor: &mut self.editor,
+            client,
+        });
         self.render().await;
     }
 
@@ -517,6 +557,7 @@ impl Application {
         hello: &Hello,
         stdin: Option<Vec<u8>>,
         backend: TerminalBackend,
+        clipboard: Option<Box<dyn Write + Send>>,
     ) -> anyhow::Result<()> {
         let theme_mode = backend.get_theme_mode();
         let terminal = Terminal::new(backend)?;
@@ -532,18 +573,18 @@ impl Application {
             .as_ref()
             .unwrap_or(&self.editor.theme)
             .clone();
-        let keep_theme = {
+        let from_config = {
             let config = self.config.load();
-            let configured = config
-                .theme
-                .as_ref()
-                .map(|theme| theme.choose(self.theme_mode));
-            let true_color = terminal.backend().supports_true_color()
-                || config.editor.true_color
-                || crate::true_color();
-            configured != Some(theme.name()) && (true_color || theme.is_16_color())
+            let configured = config.theme.as_ref();
+            configured.map(|theme| theme.choose(self.theme_mode)) == Some(theme.name())
         };
-        let state = ClientState::new(theme, hello.cwd.clone(), environment(hello));
+        let is_16_color = theme.is_16_color();
+        let state = ClientState::new(
+            theme,
+            hello.cwd.clone(),
+            environment(hello),
+            hello.clipboard_provider.clone(),
+        );
         self.editor.add_client(client, area, state);
         self.parked.insert(
             client,
@@ -551,10 +592,19 @@ impl Application {
                 compositor,
                 terminal,
                 theme_mode,
+                clipboard,
             },
         );
         self.activate(client);
+        // Now that the client's environment is the one to look in.
+        let true_color = self.terminal.backend().supports_true_color()
+            || self.config.load().editor.true_color
+            || crate::true_color();
+        let keep_theme = !from_config && (true_color || is_16_color);
 
+        if let Some(delay) = hello.auto_save {
+            self.editor.client_auto_save.insert(client, delay);
+        }
         for path in hello.files.keys() {
             reload_if_changed(&mut self.editor, path);
         }
@@ -586,6 +636,7 @@ impl Application {
         for client in session::take_suspend_requests() {
             self.suspend_client(client);
         }
+        handlers::auto_save::schedule_session_saves(&self.editor);
         let closed: Vec<_> = self.editor.tree.empty_clients().collect();
         if !closed.is_empty() {
             if !closed.into_iter().all(|client| self.detach(client)) {
@@ -707,16 +758,19 @@ impl Application {
             wait.code = code;
         }
         let _ = self.restore_term();
+        if let Some(conn) = conn {
+            conn.send_after(&mut self.terminal, vec![ServerMessage::Exit(code)]);
+        }
         if self.focused == client {
             self.focused = next;
         }
         self.activate(self.focused);
         self.editor.remove_client(client);
-        // Dropping the terminal resets it, which has to happen before the client takes it back.
+        helix_event::dispatch(ClientDetached {
+            editor: &mut self.editor,
+            client,
+        });
         self.parked.remove(&client);
-        if let Some(conn) = conn {
-            conn.send(ServerMessage::Exit(code));
-        }
         true
     }
 
@@ -729,12 +783,12 @@ impl Application {
         if let Err(err) = self.restore_term() {
             log::warn!("couldn't restore the terminal of client {client}: {err}");
         }
-        let server = self.server();
+        let server = self.server.as_mut().expect("serving");
         // Stop reading the terminal, so the shell gets its input.
         server.inputs.remove(&client);
         server.suspended.insert(client);
         if let Some(conn) = server.conns.get(&client) {
-            conn.send(ServerMessage::Suspend);
+            conn.send_after(&mut self.terminal, vec![ServerMessage::Suspend]);
         }
         if self.focused == client {
             let suspended = &self.server.as_ref().expect("serving").suspended;
@@ -778,9 +832,13 @@ impl Application {
         self.activate(self.focused);
     }
 
-    pub(super) fn is_suspended(&self) -> bool {
-        self.server
-            .as_ref()
-            .is_some_and(|server| server.suspended.contains(&self.editor.active_client()))
+    /// Whether the active client takes no frames for now: it's suspended, or its terminal is
+    /// behind. One that's behind is redrawn once it catches up.
+    pub(super) fn skips_frames(&self) -> bool {
+        self.terminal.backend().is_behind()
+            || self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.suspended.contains(&self.active))
     }
 }

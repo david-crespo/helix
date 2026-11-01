@@ -12,7 +12,7 @@ use helix_view::{
 #[cfg(all(feature = "termina", not(windows)))]
 mod termina;
 #[cfg(all(feature = "termina", not(windows)))]
-pub use self::termina::TerminaBackend;
+pub use self::termina::{TerminaBackend, TerminalWriter};
 
 #[cfg(all(feature = "termina", windows))]
 mod crossterm;

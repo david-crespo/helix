@@ -83,7 +83,7 @@ fn request_code_action_hint(editor: &mut Editor, doc_id: DocumentId, view_id: Vi
 
     let cancel = doc.code_action_controller(view_id).restart();
 
-    tokio::spawn(async move {
+    helix_event::client::spawn(async move {
         let mut actions = Vec::new();
 
         loop {

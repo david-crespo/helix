@@ -1,6 +1,5 @@
 use completion::{CompletionEvent, CompletionHandler};
-use helix_event::{register_hook, send_blocking};
-use tokio::sync::mpsc::Sender;
+use helix_event::{register_hook, send_blocking, Sender};
 
 use crate::events::ConfigDidChange;
 use crate::handlers::lsp::SignatureHelpInvoked;

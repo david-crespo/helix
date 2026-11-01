@@ -1,6 +1,7 @@
 //! Functions for working with the host environment.
 use std::{
     borrow::Cow,
+    cell::RefCell,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::{
@@ -19,10 +20,51 @@ pub type Environment = Arc<[(OsString, OsString)]>;
 
 static ENVIRONMENT: RwLock<Option<Environment>> = RwLock::new(None);
 
+/// The working directory and environment as they were when [`Snapshot::capture`] took them.
+///
+/// A server swaps the statics above as it switches between clients, so work that runs
+/// elsewhere, on another thread or in a task, would read those of whichever client is active
+/// at that moment. Work for a client takes a snapshot where it's handed off and runs in it.
+#[derive(Clone)]
+pub struct Snapshot {
+    cwd: Arc<Path>,
+    env: Option<Environment>,
+}
+
+thread_local! {
+    /// What this thread reads in place of the statics, while it runs in a [`Snapshot`].
+    static SNAPSHOT: RefCell<Option<Snapshot>> = const { RefCell::new(None) };
+}
+
+impl Snapshot {
+    pub fn capture() -> Self {
+        Self {
+            cwd: current_working_dir().into(),
+            env: environment(),
+        }
+    }
+
+    /// Runs `f` with this thread reading the snapshot.
+    pub fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let outer = SNAPSHOT.replace(Some(self.clone()));
+        let result = f();
+        SNAPSHOT.set(outer);
+        result
+    }
+
+    /// Has this thread read the snapshot from now on.
+    pub fn adopt(self) {
+        SNAPSHOT.set(Some(self));
+    }
+}
+
 /// Get the current working directory.
 /// This information is managed internally as the call to std::env::current_dir
 /// might fail if the cwd has been deleted.
 pub fn current_working_dir() -> PathBuf {
+    if let Some(cwd) = SNAPSHOT.with_borrow(|snapshot| Some(snapshot.as_ref()?.cwd.to_path_buf())) {
+        return cwd;
+    }
     if let Some(path) = &*CWD.read().unwrap() {
         return path.clone();
     }
@@ -86,7 +128,7 @@ pub fn swap_environment(env: Option<Environment>) -> Option<Environment> {
 pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     command.current_dir(current_working_dir());
-    if let Some(env) = &*ENVIRONMENT.read().unwrap() {
+    if let Some(env) = environment() {
         command
             .env_clear()
             .envs(env.iter().map(|(key, value)| (key, value)));
@@ -94,25 +136,66 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     command
 }
 
-/// Checks if the given environment variable is set.
+/// The environment [`command`] gives programs, if it isn't this process's own: in a server,
+/// the active client's.
+pub fn environment() -> Option<Environment> {
+    SNAPSHOT
+        .with_borrow(|snapshot| snapshot.as_ref().map(|snapshot| snapshot.env.clone()))
+        .unwrap_or_else(|| ENVIRONMENT.read().unwrap().clone())
+}
+
+/// An environment variable as [`command`] gives it to programs: in a server, the active
+/// client's.
+pub fn var_os(name: impl AsRef<OsStr>) -> Option<OsString> {
+    let name = name.as_ref();
+    match environment() {
+        Some(env) => env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone()),
+        None => std::env::var_os(name),
+    }
+}
+
+/// Checks if the given environment variable is set, in the environment [`var_os`] reads.
 pub fn env_var_is_set(env_var_name: &str) -> bool {
-    std::env::var_os(env_var_name).is_some()
+    var_os(env_var_name).is_some()
 }
 
 /// Checks if a binary with the given name exists.
 pub fn binary_exists<T: AsRef<OsStr>>(binary_name: T) -> bool {
-    which::which(binary_name).is_ok()
+    which(binary_name).is_ok()
 }
 
 /// Attempts to find a binary of the given name. See [which](https://linux.die.net/man/1/which).
+/// Like [`command`], which runs it, this looks in [`current_working_dir`] and the `PATH` that
+/// [`var_os`] gives: in a server, the active client's.
 pub fn which<T: AsRef<OsStr>>(
     binary_name: T,
 ) -> Result<std::path::PathBuf, ExecutableNotFoundError> {
-    let binary_name = binary_name.as_ref();
-    which::which(binary_name).map_err(|err| ExecutableNotFoundError {
-        command: binary_name.to_string_lossy().into_owned(),
-        inner: err,
-    })
+    let found = which::which_in(&binary_name, var_os("PATH"), current_working_dir());
+    found.map_err(|err| not_found(binary_name, err))
+}
+
+/// Like [`which`], but on this process's own `PATH`, for programs that run with the process's
+/// environment whichever client needs them, as language servers do. A relative path is still
+/// relative to [`current_working_dir`].
+pub fn which_for_process<T: AsRef<OsStr>>(
+    binary_name: T,
+) -> Result<std::path::PathBuf, ExecutableNotFoundError> {
+    which::which_in(
+        &binary_name,
+        std::env::var_os("PATH"),
+        current_working_dir(),
+    )
+    .map_err(|err| not_found(binary_name, err))
+}
+
+fn not_found(binary_name: impl AsRef<OsStr>, inner: which::Error) -> ExecutableNotFoundError {
+    ExecutableNotFoundError {
+        command: binary_name.as_ref().to_string_lossy().into_owned(),
+        inner,
+    }
 }
 
 fn find_brace_end(src: &[u8]) -> Option<usize> {
@@ -198,14 +281,15 @@ fn expand_impl(src: &OsStr, mut resolve: impl FnMut(&OsStr) -> Option<OsString>)
     }
 }
 
-/// performs substitution of enviorment variables. Supports the following (POSIX) syntax:
+/// performs substitution of enviorment variables, as [`var_os`] gives them. Supports the
+/// following (POSIX) syntax:
 ///
 /// * `$<var>`, `${<var>}`
 /// * `${<var>:-<default>}`, `${<var>-<default>}`
 /// * `${<var>:=<default>}`, `${<var>=default}`
 ///
 pub fn expand<S: AsRef<OsStr> + ?Sized>(src: &S) -> Cow<'_, OsStr> {
-    expand_impl(src.as_ref(), |var| std::env::var_os(var))
+    expand_impl(src.as_ref(), |var| var_os(var))
 }
 
 #[derive(Debug)]

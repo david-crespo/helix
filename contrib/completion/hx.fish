@@ -20,6 +20,7 @@ complete -c hx -s s -l session -x -d "Join the editor shared under this name"
 complete -c hx -l no-session -d "Run a separate editor instead of joining the session"
 complete -c hx -l remote -d "Open the files in the session's last used terminal and exit"
 complete -c hx -l wait -d "With --remote, exit once none of the files is shown"
+complete -c hx -l auto-save -x -d "Save this terminal's buffers <ms> after an edit and on focus lost"
 
 function __hx_langs_ops
     hx --health all-languages | tail -n '+2' | string replace -fr '^(\S+) .*' '$1'

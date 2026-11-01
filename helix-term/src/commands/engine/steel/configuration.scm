@@ -24,6 +24,7 @@
 ;; file-line-ending	            The file line endings (CRLF or LF)
 ;; file-indent-style	        The file indentation style
 ;; read-only-indicator	        An indicator that shows [readonly] when a file cannot be written
+;; auto-save-indicator	        An indicator that shows [auto-save] when edits to the file are saved after a delay
 ;; total-line-numbers	        The total line numbers of the opened file
 ;; file-type	                The type of the opened file
 ;; diagnostics	                The number of warnings and/or errors

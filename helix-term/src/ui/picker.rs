@@ -15,10 +15,10 @@ use crate::{
 };
 use futures_util::future::BoxFuture;
 use helix_event::AsyncHook;
+use helix_event::Sender;
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Nucleo};
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
 use tui::{
     buffer::Buffer as Surface,
     layout::Constraint,

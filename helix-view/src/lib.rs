@@ -52,15 +52,7 @@ slotmap::new_key_type! {
     pub struct ViewId;
 }
 
-/// One terminal showing the editor. A standalone editor has a single client, the default one.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub struct ClientId(pub u32);
-
-impl std::fmt::Display for ClientId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use helix_event::client::ClientId;
 
 pub enum Align {
     Top,

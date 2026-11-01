@@ -286,7 +286,7 @@ fn request_completions(
             replace_completions(handle_, requests, false).await;
         }
     };
-    tokio::spawn(cancelable_future(request_completions, handle));
+    helix_event::client::spawn(cancelable_future(request_completions, handle));
 }
 
 fn request_completions_from_language_server(
@@ -369,6 +369,6 @@ pub fn request_incomplete_completion_list(editor: &mut Editor, handle: TaskHandl
         requests.spawn(request);
     }
     if !requests.is_empty() {
-        tokio::spawn(replace_completions(handle, requests, true));
+        helix_event::client::spawn(replace_completions(handle, requests, true));
     }
 }

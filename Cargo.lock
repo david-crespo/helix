@@ -2035,6 +2035,7 @@ dependencies = [
  "foldhash 0.2.0",
  "futures-executor",
  "hashbrown 0.17.1",
+ "helix-stdx",
  "log",
  "once_cell",
  "parking_lot",

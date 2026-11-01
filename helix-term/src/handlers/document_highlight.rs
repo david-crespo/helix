@@ -43,7 +43,7 @@ fn request_document_highlights(editor: &mut Editor, doc_id: DocumentId, view_id:
     let text = doc.text().clone();
     let cancel = doc.document_highlight_controller(view_id).restart();
 
-    tokio::spawn(async move {
+    helix_event::client::spawn(async move {
         let response = match cancelable_future(future, &cancel).await {
             Some(Ok(response)) => response,
             Some(Err(err)) => {

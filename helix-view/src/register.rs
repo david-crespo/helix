@@ -28,6 +28,12 @@ pub struct Registers {
     /// efficiently prepend new values in `Registers::push`.
     inner: HashMap<char, Vec<String>>,
     clipboard_provider: Box<dyn DynAccess<ClipboardProvider>>,
+    /// The provider the config gave when the editor started.
+    started_with: ClipboardProvider,
+    /// The active client's provider, in a server whose clients each resolved the config in their
+    /// own environment, such as one over SSH and one local. It applies until the config gives
+    /// another provider than it started with.
+    pub client_clipboard: Option<ClipboardProvider>,
     pub last_search_register: char,
 }
 
@@ -35,8 +41,19 @@ impl Registers {
     pub fn new(clipboard_provider: Box<dyn DynAccess<ClipboardProvider>>) -> Self {
         Self {
             inner: Default::default(),
+            started_with: clipboard_provider.load().clone(),
             clipboard_provider,
+            client_clipboard: None,
             last_search_register: '/',
+        }
+    }
+
+    /// The active client's clipboard provider.
+    fn clipboard(&self) -> ClipboardProvider {
+        let configured = self.clipboard_provider.load();
+        match &self.client_clipboard {
+            Some(provider) if *configured == self.started_with => provider.clone(),
+            _ => configured.clone(),
         }
     }
 
@@ -62,7 +79,7 @@ impl Registers {
                 Some(RegisterValues::new(iter::once(path)))
             }
             '*' | '+' => Some(read_from_clipboard(
-                &self.clipboard_provider.load(),
+                &self.clipboard(),
                 self.inner.get(&name),
                 match name {
                     '+' => ClipboardType::Clipboard,
@@ -82,7 +99,7 @@ impl Registers {
             '_' => Ok(()),
             '#' | '.' | '%' => Err(anyhow::anyhow!("Register {name} does not support writing")),
             '*' | '+' => {
-                self.clipboard_provider.load().set_contents(
+                self.clipboard().set_contents(
                     &values.join(NATIVE_LINE_ENDING.as_str()),
                     match name {
                         '+' => ClipboardType::Clipboard,
@@ -112,10 +129,7 @@ impl Registers {
                     '*' => ClipboardType::Selection,
                     _ => unreachable!(),
                 };
-                let contents = self
-                    .clipboard_provider
-                    .load()
-                    .get_contents(&clipboard_type)?;
+                let contents = self.clipboard().get_contents(&clipboard_type)?;
                 let saved_values = self.inner.entry(name).or_default();
 
                 if !contents_are_saved(saved_values, &contents) {
@@ -127,9 +141,7 @@ impl Registers {
                     value.push_str(NATIVE_LINE_ENDING.as_str());
                 }
                 value.push_str(&contents);
-                self.clipboard_provider
-                    .load()
-                    .set_contents(&value, clipboard_type)?;
+                self.clipboard().set_contents(&value, clipboard_type)?;
 
                 Ok(())
             }
@@ -199,11 +211,7 @@ impl Registers {
     }
 
     fn clear_clipboard(&mut self, clipboard_type: ClipboardType) {
-        if let Err(err) = self
-            .clipboard_provider
-            .load()
-            .set_contents("", clipboard_type)
-        {
+        if let Err(err) = self.clipboard().set_contents("", clipboard_type) {
             log::error!(
                 "Failed to clear {} clipboard: {err}",
                 match clipboard_type {
@@ -215,7 +223,7 @@ impl Registers {
     }
 
     pub fn clipboard_provider_name(&self) -> String {
-        self.clipboard_provider.load().name().into_owned()
+        self.clipboard().name().into_owned()
     }
 }
 

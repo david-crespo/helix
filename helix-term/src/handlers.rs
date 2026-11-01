@@ -17,7 +17,7 @@ use self::document_colors::DocumentColorsHandler;
 use self::document_links::DocumentLinksHandler;
 
 pub(crate) mod auto_reload;
-mod auto_save;
+pub mod auto_save;
 mod code_action_hint;
 pub mod completion;
 pub mod diagnostics;

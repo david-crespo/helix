@@ -56,4 +56,5 @@ set edit:completion:arg-completer[hx] = {|@args|
   $candidate "--no-session" "(Runs a separate editor instead of joining the session)"
   $candidate "--remote" "(Opens the files in the session's last used terminal and exits)"
   $candidate "--wait" "(With --remote, exits once none of the files is shown)"
+  $candidate "--auto-save" "(Saves this terminal's buffers <ms> after an edit and on focus lost)"
 }

@@ -6,6 +6,7 @@ use helix_view::events::{
     DocumentDidClose, DocumentDidOpen, DocumentFocusLost, DocumentSaved, LanguageServerExited,
     LanguageServerInitialized, SelectionDidChange,
 };
+use helix_view::{ClientId, Editor};
 
 use crate::commands;
 use crate::keymap::MappableCommand;
@@ -16,6 +17,9 @@ events! {
     PostCommand<'a, 'cx> { command: & 'a MappableCommand, cx: &'a mut commands::Context<'cx> }
     TerminalFocusGained<'a, 'cx> { cx: &'a mut commands::Context<'cx> }
     TerminalFocusLost<'a, 'cx> { cx: &'a mut commands::Context<'cx> }
+    // A terminal joined or left a shared editor. The session's first client doesn't attach.
+    ClientAttached<'a> { editor: &'a mut Editor, client: ClientId }
+    ClientDetached<'a> { editor: &'a mut Editor, client: ClientId }
 }
 
 pub fn register() {
@@ -24,6 +28,8 @@ pub fn register() {
     register_event::<PostCommand>();
     register_event::<TerminalFocusGained>();
     register_event::<TerminalFocusLost>();
+    register_event::<ClientAttached>();
+    register_event::<ClientDetached>();
     register_event::<DocumentDidOpen>();
     register_event::<DocumentDidChange>();
     register_event::<DocumentDidClose>();

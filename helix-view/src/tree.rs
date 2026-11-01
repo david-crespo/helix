@@ -197,6 +197,14 @@ impl Tree {
         self.with_client(client, |tree| tree.traverse().map(|(id, _)| id).collect())
     }
 
+    /// The view `client` has focused. In a client with no views left, that's its root container.
+    pub fn client_focus(&self, client: ClientId) -> ViewId {
+        if client == self.active {
+            return self.focus;
+        }
+        self.parked[&client].focus
+    }
+
     /// The active client's views, in the same order as [`Tree::views`], with whether each is
     /// focused.
     pub fn active_views(&self) -> impl Iterator<Item = (&View, bool)> {
@@ -221,7 +229,7 @@ impl Tree {
     }
 
     /// The client whose layout contains `view`.
-    pub(crate) fn client_of(&self, view: ViewId) -> ClientId {
+    pub fn client_of(&self, view: ViewId) -> ClientId {
         let mut node = view;
         while self.nodes[node].parent != node {
             node = self.nodes[node].parent;

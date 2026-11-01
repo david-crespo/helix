@@ -15,9 +15,6 @@ pub mod logging;
 pub mod session;
 pub mod ui;
 
-#[cfg(not(windows))]
-use std::env::var_os;
-
 use std::path::Path;
 
 use futures_util::Future;
@@ -31,21 +28,24 @@ fn true_color() -> bool {
     true
 }
 
+/// Whether the active client's environment says its terminal has true color.
 #[cfg(not(windows))]
 fn true_color() -> bool {
+    use helix_stdx::env::var_os;
     if var_os("COLORTERM").is_some_and(|v| v == "truecolor" || v == "24bit")
         || var_os("WSL_DISTRO_NAME").is_some()
     {
         return true;
     }
 
-    match termini::TermInfo::from_env() {
-        Ok(t) => {
+    let term = var_os("TERM");
+    match term.and_then(|term| termini::TermInfo::from_name(term.to_str()?).ok()) {
+        Some(t) => {
             t.extended_cap("RGB").is_some()
                 || t.extended_cap("Tc").is_some()
                 || (t.extended_cap("setrgbf").is_some() && t.extended_cap("setrgbb").is_some())
         }
-        Err(_) => false,
+        None => false,
     }
 }
 

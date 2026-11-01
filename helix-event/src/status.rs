@@ -3,9 +3,9 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+use crate::client::{self, Receiver, Sender};
 use crate::{runtime_local, send_blocking};
 use once_cell::sync::OnceCell;
-use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Describes the severity level of a [`StatusMessage`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
@@ -43,9 +43,10 @@ runtime_local! {
     static MESSAGES: OnceCell<Sender<StatusMessage>> = OnceCell::new();
 }
 
+/// Shows a message to the current client, or with no current client, to every client.
 pub async fn report(msg: impl Into<StatusMessage>) {
     // if the error channel overflows just ignore it
-    let _ = MESSAGES
+    MESSAGES
         .wait()
         .send_timeout(msg.into(), Duration::from_millis(10))
         .await;
@@ -62,7 +63,7 @@ pub fn report_blocking(msg: impl Into<StatusMessage>) {
 /// # Panics
 /// If called multiple times
 pub fn setup() -> Receiver<StatusMessage> {
-    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    let (tx, rx) = client::channel(128);
     let _ = MESSAGES.set(tx);
     rx
 }

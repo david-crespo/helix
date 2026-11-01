@@ -224,8 +224,9 @@ impl Client {
         Arc<Notify>,
     )> {
         info!("Starting lsp {name:?} in root {root_path:?}");
-        // Resolve path to the binary
-        let cmd = helix_stdx::env::which(cmd)?;
+        // Resolve path to the binary. A server shared between clients runs it with its own
+        // environment, so that's where to look for it.
+        let cmd = helix_stdx::env::which_for_process(cmd)?;
 
         let process = Command::new(cmd)
             .envs(server_environment)

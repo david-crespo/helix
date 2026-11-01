@@ -434,6 +434,8 @@ pub mod completers {
     use once_cell::sync::Lazy;
     use std::borrow::Cow;
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
     use tui::text::Span;
 
     pub type Completer = fn(&Editor, &str) -> Vec<Completion>;
@@ -744,13 +746,16 @@ pub mod completers {
     }
 
     pub fn program(_editor: &Editor, input: &str) -> Vec<Completion> {
-        static PROGRAMS_IN_PATH: Lazy<BTreeSet<String>> = Lazy::new(|| {
-            // Go through the entire PATH and read all files into a set.
-            let Some(path) = std::env::var_os("PATH") else {
-                return Default::default();
-            };
+        // A `PATH` and the programs in it. Listed again when the `PATH` is another one, as it
+        // can be for each client of a server.
+        static PROGRAMS_IN_PATH: Mutex<(Option<OsString>, BTreeSet<String>)> =
+            Mutex::new((None, BTreeSet::new()));
 
-            std::env::split_paths(&path)
+        let path = helix_stdx::env::var_os("PATH");
+        let mut listed = PROGRAMS_IN_PATH.lock().unwrap();
+        if listed.0 != path {
+            // Go through the entire PATH and read all files into a set.
+            listed.1 = std::env::split_paths(path.as_deref().unwrap_or_default())
                 .filter_map(|path| std::fs::read_dir(path).ok())
                 .flatten()
                 .filter_map(|res| {
@@ -762,10 +767,11 @@ pub mod completers {
                         None
                     }
                 })
-                .collect()
-        });
+                .collect();
+            listed.0 = path;
+        }
 
-        fuzzy_match(input, PROGRAMS_IN_PATH.iter(), false)
+        fuzzy_match(input, listed.1.iter(), false)
             .into_iter()
             .map(|(name, _)| ((0..), name.clone().into()))
             .collect()

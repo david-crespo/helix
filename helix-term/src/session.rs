@@ -37,7 +37,7 @@ use std::{
 
 use anyhow::Context as _;
 use helix_core::Position;
-use helix_view::{editor::SessionConfig, tree::Layout, ClientId};
+use helix_view::{clipboard::ClipboardProvider, editor::SessionConfig, tree::Layout, ClientId};
 use indexmap::IndexMap;
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -100,16 +100,20 @@ pub struct Hello {
     pub load_tutor: bool,
     /// With `--remote`, whether to wait until none of the files is shown.
     pub wait: bool,
+    pub auto_save: Option<u64>,
     /// The client's working directory: the one `--working-dir` or a directory argument asks
     /// for, or else where it was started.
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     /// Whether a second file descriptor, the client's stdin, came with the terminal's.
     pub stdin_piped: bool,
+    /// The clipboard provider the client's config gives in its environment: the one it names, or
+    /// else the one Helix detects there.
+    pub clipboard_provider: ClipboardProvider,
 }
 
 impl Hello {
-    fn new(args: &Args, stdin_piped: bool) -> Self {
+    fn new(args: &Args, config: &Config, stdin_piped: bool) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             build: build_id().to_owned(),
@@ -117,6 +121,7 @@ impl Hello {
             split: args.split,
             load_tutor: args.load_tutor,
             wait: args.wait,
+            auto_save: args.auto_save,
             cwd: helix_stdx::env::current_working_dir(),
             env: std::env::vars_os()
                 .filter_map(|(key, value)| {
@@ -124,6 +129,7 @@ impl Hello {
                 })
                 .collect(),
             stdin_piped,
+            clipboard_provider: config.editor.clipboard_provider.clone(),
         }
     }
 
@@ -284,7 +290,7 @@ fn log_path(key: &str) -> PathBuf {
 
 /// Runs `hx` as a client of the session `key`'s server, starting the server if needed, and
 /// returns the exit code for this process.
-pub fn run_client(key: &str, args: &Args) -> anyhow::Result<i32> {
+pub fn run_client(key: &str, args: &Args, config: &Config) -> anyhow::Result<i32> {
     // `pkill -USR1 hx`, which has Helix reload its config, reaches clients too. Taking the
     // signal here keeps it from ending them: the server does the reloading.
     use signal_hook::consts::{SIGUSR1, SIGWINCH};
@@ -292,7 +298,7 @@ pub fn run_client(key: &str, args: &Args) -> anyhow::Result<i32> {
 
     let path = socket_path(key)?;
     let conn = match UnixStream::connect(&path) {
-        Ok(conn) if args.remote => return run_remote(&conn, args),
+        Ok(conn) if args.remote => return run_remote(&conn, args, config),
         Ok(conn) => conn,
         // With no session to open them in, `--remote` files open here.
         Err(_) => {
@@ -317,7 +323,7 @@ pub fn run_client(key: &str, args: &Args) -> anyhow::Result<i32> {
         fds.push(stdin.as_fd());
     }
     send_fds(&conn, &fds)?;
-    write_message(&conn, &Hello::new(args, stdin_piped))?;
+    write_message(&conn, &Hello::new(args, config, stdin_piped))?;
 
     let resized = conn.try_clone()?;
     std::thread::spawn(move || {
@@ -365,9 +371,9 @@ pub fn run_client(key: &str, args: &Args) -> anyhow::Result<i32> {
 
 /// Has the server open this command line's files in its focused client, and waits for it to
 /// say it's done.
-fn run_remote(conn: &UnixStream, args: &Args) -> anyhow::Result<i32> {
+fn run_remote(conn: &UnixStream, args: &Args, config: &Config) -> anyhow::Result<i32> {
     send_fds(conn, &[])?;
-    write_message(conn, &Hello::new(args, false))?;
+    write_message(conn, &Hello::new(args, config, false))?;
     loop {
         match read_message(conn).context("the helix session server went away")? {
             ServerMessage::Error(message) => eprintln!("{message}"),

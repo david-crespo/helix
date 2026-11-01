@@ -56,7 +56,7 @@ fn send(coordinator: &mpsc::UnboundedSender<Event>, event: Event) {
 pub struct Handler {
     pub(super) index: WordIndex,
     /// A sender into an async hook which debounces updates to the index.
-    hook: mpsc::Sender<Event>,
+    hook: helix_event::Sender<Event>,
     /// A sender to a tokio task which coordinates the indexing of documents.
     ///
     /// See [WordIndex::run]. A supervisor-like task is in charge of spawning tasks to update the
@@ -77,7 +77,7 @@ impl Handler {
         let index = WordIndex::default();
         let (tx, rx) = mpsc::unbounded_channel();
         let mut cancel = TaskController::new();
-        tokio::spawn(index.clone().run(rx, cancel.restart()));
+        helix_event::client::spawn(index.clone().run(rx, cancel.restart()));
         Self {
             hook: Hook {
                 changes: HashMap::default(),
@@ -296,7 +296,7 @@ impl WordIndex {
             }
             let this = self.clone();
             let cancel = cancel.clone();
-            tokio::task::spawn_blocking(move || match event {
+            helix_event::client::spawn_blocking(move || match event {
                 Event::Insert(text) => {
                     this.add_document(&text, &cancel);
                 }

@@ -958,7 +958,7 @@ impl Document {
 
                 let mut stdin = process.stdin.take().ok_or(FormatterError::BrokenStdin)?;
                 let input_text = text.clone();
-                let input_task = tokio::spawn(async move {
+                let input_task = helix_event::client::spawn(async move {
                     to_writer(&mut stdin, (encoding::UTF_8, false), &input_text).await
                     // Note that `stdin` is dropped here, causing the pipe to close. This can
                     // avoid a deadlock with `wait_with_output` below if the process is waiting on
@@ -1139,7 +1139,7 @@ impl Document {
                 // the whole automatically delete path on drop thing
                 // since the path doesn't exist yet, we just want
                 // the path
-                tokio::task::spawn_blocking(move || -> Option<PathBuf> {
+                helix_event::client::spawn_blocking(move || -> Option<PathBuf> {
                     let mut builder = tempfile::Builder::new();
                     builder.prefix(path_.file_name()?).suffix(".bck");
 
@@ -1216,7 +1216,7 @@ impl Document {
                         .map_err(|e| log::error!("Failed to restore backup on write failure: {e}"));
                 } else {
                     // copy metadata and delete backup
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let _ = helix_event::client::spawn_blocking(move || {
                         let _ = copy_metadata(&backup, &write_path)
                             .map_err(|e| log::error!("Failed to copy metadata on write: {e}"));
                         let _ = std::fs::remove_file(backup)

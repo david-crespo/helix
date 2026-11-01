@@ -1622,17 +1622,6 @@ impl Component for EditorView {
             }
             Event::FocusLost => {
                 helix_event::dispatch(TerminalFocusLost { cx: &mut cx });
-                if context.editor.config().auto_save.focus_lost {
-                    let options = commands::WriteAllOptions {
-                        force: false,
-                        write_scratch: false,
-                        auto_format: false,
-                        code_actions: false,
-                    };
-                    if let Err(e) = commands::typed::write_all_impl(context, options) {
-                        context.editor.set_error(format!("{}", e));
-                    }
-                }
                 self.terminal_focused = false;
                 EventResult::Consumed(None)
             }

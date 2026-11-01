@@ -165,6 +165,7 @@ where
             render_file_modification_indicator
         }
         helix_view::editor::StatusLineElement::ReadOnlyIndicator => render_read_only_indicator,
+        helix_view::editor::StatusLineElement::AutoSaveIndicator => render_auto_save_indicator,
         helix_view::editor::StatusLineElement::FileEncoding => render_file_encoding,
         helix_view::editor::StatusLineElement::FileLineEnding => render_file_line_ending,
         helix_view::editor::StatusLineElement::FileIndentStyle => render_file_indent_style,
@@ -533,6 +534,19 @@ where
 {
     let title = if get_doc(context).readonly {
         " [readonly] "
+    } else {
+        ""
+    };
+    write(context, title.into());
+}
+
+fn render_auto_save_indicator<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let doc = get_doc(context);
+    let title = if context.editor.doc_auto_save_delay(doc).is_some() {
+        " [auto-save] "
     } else {
         ""
     };

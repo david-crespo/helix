@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{self, AtomicBool},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -14,15 +14,37 @@ use helix_view::{
     document::Mode,
     events::DocumentDidChange,
     handlers::{AutoSaveEvent, Handlers},
-    Editor,
+    ClientId, DocumentId, Editor,
 };
 use tokio::time::Instant;
 
 use crate::{
     commands, compositor,
-    events::OnModeSwitch,
+    events::{OnModeSwitch, TerminalFocusLost},
     job::{self, Jobs},
+    session,
 };
+
+/// The documents edited in a session, each with the client that edited it, waiting for
+/// [`schedule_session_saves`].
+static EDITED: Mutex<Vec<(Option<ClientId>, DocumentId)>> = Mutex::new(Vec::new());
+
+/// Times the saves of the documents edited in a session since the last call. A document saves
+/// after the shortest delay of the clients that have it open and auto-save, whichever client
+/// edited it. It takes the editor to tell, which hooks on edits don't have.
+pub fn schedule_session_saves(editor: &Editor) {
+    for (client, doc) in std::mem::take(&mut *EDITED.lock().unwrap()) {
+        let delay = editor
+            .document(doc)
+            .and_then(|doc| editor.doc_auto_save_delay(doc));
+        if let Some(save_after) = delay {
+            let event = AutoSaveEvent::DocumentChanged { save_after };
+            helix_event::client::sync_scope(client, || {
+                send_blocking(&editor.handlers.auto_save, event)
+            });
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct AutoSaveHandler {
@@ -81,6 +103,17 @@ impl helix_event::AsyncHook for AutoSaveHandler {
 }
 
 fn request_auto_save(editor: &mut Editor) {
+    // In a session, only the documents some client auto-saves.
+    let docs = session::is_server().then(|| {
+        let docs = editor.documents();
+        let docs = docs.filter(|doc| editor.doc_auto_save_delay(doc).is_some());
+        docs.map(|doc| doc.id()).collect()
+    });
+    save(editor, docs);
+}
+
+/// Saves the modified documents among `docs`, or all of them.
+fn save(editor: &mut Editor, docs: Option<Vec<DocumentId>>) {
     let context = &mut compositor::Context {
         editor,
         scroll: Some(0),
@@ -94,14 +127,43 @@ fn request_auto_save(editor: &mut Editor) {
         code_actions: false,
     };
 
-    if let Err(e) = commands::typed::write_all_impl(context, options) {
+    let saved = match docs {
+        Some(docs) => commands::typed::write_docs_impl(context, options, |doc| docs.contains(&doc)),
+        None => commands::typed::write_all_impl(context, options),
+    };
+    if let Err(e) = saved {
         context.editor.set_error(format!("{}", e));
     }
+}
+
+/// When a terminal loses focus, saves the modified documents, if auto-save says to. In a
+/// session, the client that lost focus saves those it has open, if it auto-saves.
+fn save_on_focus_lost(editor: &mut Editor) {
+    let focus_lost = editor.config().auto_save.focus_lost;
+    if !session::is_server() {
+        if focus_lost {
+            save(editor, None);
+        }
+        return;
+    }
+    let client = editor.active_client();
+    if !focus_lost && !editor.client_auto_save.contains_key(&client) {
+        return;
+    }
+    let docs = editor.documents();
+    let docs = docs.filter(|doc| editor.clients_with(doc).any(|c| c == client));
+    let docs = docs.map(|doc| doc.id()).collect();
+    save(editor, Some(docs));
 }
 
 pub(super) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.auto_save.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        if session::is_server() {
+            let edited = (helix_event::client::current(), event.doc.id());
+            EDITED.lock().unwrap().push(edited);
+            return Ok(());
+        }
         let config = event.doc.config.load();
         if config.auto_save.after_delay.enable {
             send_blocking(
@@ -119,6 +181,11 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         if event.old_mode == Mode::Insert {
             send_blocking(&tx, AutoSaveEvent::LeftInsertMode)
         }
+        Ok(())
+    });
+
+    register_hook!(move |event: &mut TerminalFocusLost<'_, '_>| {
+        save_on_focus_lost(event.cx.editor);
         Ok(())
     });
 }

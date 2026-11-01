@@ -1,3 +1,4 @@
+mod clients;
 pub mod components;
 
 use arc_swap::{ArcSwap, ArcSwapAny};
@@ -41,7 +42,7 @@ use helix_view::{
     theme::Color,
     DocumentId, Editor, Theme, ViewId,
 };
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use steel::{
     compiler::modules::steel_home,
@@ -101,18 +102,21 @@ static GLOBAL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static IDENTIFIERS_AVAILABLE_AFTER_BOOT: Lazy<Mutex<HashSet<InternedString>>> =
     Lazy::new(|| Mutex::new(HashSet::default()));
 
-static EVENT_READER: OnceCell<EventReader> = OnceCell::new();
+/// The active client's terminal, which Ctrl-C interrupts a running command from.
+static EVENT_READER: Mutex<Option<EventReader>> = Mutex::new(None);
 
 static CTX: &str = "*helix.cx*";
 static CONFIG: &str = "*helix.config*";
 
-fn install_event_reader(event_reader: TerminalEventReaderHandle) {
+/// Sets the terminal that Ctrl-C interrupts a running command from. A server with several
+/// clients sets the active client's.
+pub(crate) fn install_event_reader(event_reader: TerminalEventReaderHandle) {
     #[cfg(feature = "integration")]
     {}
 
     #[cfg(all(not(windows), not(feature = "integration")))]
     {
-        EVENT_READER.set(event_reader.reader).ok();
+        *EVENT_READER.lock().unwrap() = Some(event_reader.reader);
     }
 }
 
@@ -163,10 +167,10 @@ fn setup() -> Engine {
 
         #[cfg(unix)]
         {
-            EVENT_READER
-                .get()
-                .unwrap()
-                .poll(Some(Duration::from_millis(0)), |_| true)
+            let reader = EVENT_READER.lock().unwrap().clone();
+            reader.map_or(Ok(false), |reader| {
+                reader.poll(Some(Duration::from_millis(0)), |_| true)
+            })
         }
     }
 
@@ -186,7 +190,8 @@ fn setup() -> Engine {
             while running.load(std::sync::atomic::Ordering::Relaxed) {
                 #[cfg(unix)]
                 if is_event_available().unwrap_or(false) {
-                    let event = EVENT_READER.get().unwrap().read(|_| true);
+                    let reader = EVENT_READER.lock().unwrap().clone().unwrap();
+                    let event = reader.read(|_| true);
 
                     if let Ok(termina::Event::Key(termina::event::KeyEvent {
                         code: termina::event::KeyCode::Char('c'),
@@ -1443,6 +1448,7 @@ fn load_editor_api(engine: &mut Engine, generate_sources: bool) {
     let builtin_editor_command_module = include_str!("editor.scm").to_string();
 
     module.register_fn("register-hook", register_hook);
+    clients::register_api(&mut module);
 
     module
         .register_fn("Action/Load", || Action::Load)
@@ -2977,6 +2983,7 @@ impl HelixConfiguration {
                             StatusLineElement::FileModificationIndicator
                         }
                         "read-only-indicator" => StatusLineElement::ReadOnlyIndicator,
+                        "auto-save-indicator" => StatusLineElement::AutoSaveIndicator,
                         "file-encoding" => StatusLineElement::FileEncoding,
                         "file-line-ending" => StatusLineElement::FileLineEnding,
                         "file-indent-style" => StatusLineElement::FileIndentStyle,
@@ -3466,6 +3473,8 @@ fn register_hook(event_kind: String, callback_fn: SteelVal) -> steel::UnRecovera
         "document-changed" => register_document_changed(generation, rooted),
         "document-closed" => register_document_closed(generation, rooted),
         "document-changed-on-disk" => register_document_changed_on_disk(generation, rooted),
+        "client-attached" => clients::register_client_attached(generation, rooted),
+        "client-detached" => clients::register_client_detached(generation, rooted),
         _ => steelerr!(Generic => "Unable to register hook: Unknown event type: {}", event_kind)
             .into(),
     }
@@ -4293,6 +4302,53 @@ fn fuzzy_match(pattern: SteelString, items: SteelVal) -> Vec<SteelVal> {
     Vec::new()
 }
 
+/// Replaces Steel's primitives that read the environment or spawn processes with ones that
+/// use the environment and working directory Helix's own commands do (see
+/// [`helix_stdx::env::command`]). With several clients sharing the editor, those are the
+/// client's that the code runs as, not the server process's.
+fn use_client_environment(engine: &mut Engine) {
+    use steel::primitives::process;
+
+    fn env_var(name: String) -> Result<String, SteelErr> {
+        let value = helix_stdx::env::var_os(&name).ok_or(std::env::VarError::NotPresent);
+        value
+            .and_then(|value| value.into_string().map_err(std::env::VarError::NotUnicode))
+            .map_err(|err| SteelErr::new(ErrorKind::Generic, err.to_string()))
+    }
+
+    fn command(name: SteelString, args: SteelVal) -> Result<SteelVal, SteelErr> {
+        let SteelVal::ListV(args) = &args else {
+            steel::stop!(TypeMismatch => "command expects a list of arguments, found: {}", args);
+        };
+        let builder = process::command(name, args)?;
+        // Standalone, programs get this process's environment, as Steel would give them.
+        let Some(env) = helix_stdx::env::environment() else {
+            return Ok(builder);
+        };
+        process::clear_env_var(builder.clone())?;
+        for (key, value) in env.iter() {
+            if let (Some(key), Some(value)) = (key.to_str(), value.to_str()) {
+                process::set_env_var(builder.clone(), key.into(), value.into())?;
+            }
+        }
+        let cwd = helix_stdx::env::current_working_dir();
+        process::current_dir(builder, cwd.to_string_lossy().into_owned())
+    }
+
+    engine
+        .register_fn("env-var", env_var)
+        .register_fn("command", command);
+    // Steel's own wraps `env-var` in a `Result`, which only Scheme code can make.
+    let maybe_get_env_var = engine
+        .compile_and_run_raw_program(
+            "(lambda (name) (with-handler (lambda (err) (Err err)) (Ok (env-var name))))",
+        )
+        .ok()
+        .and_then(|mut values| values.pop())
+        .expect("maybe-get-env-var compiles");
+    engine.register_value("maybe-get-env-var", maybe_get_env_var);
+}
+
 fn configure_engine_impl(mut engine: Engine) -> Engine {
     log::info!("Loading engine!");
 
@@ -4311,6 +4367,7 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
     );
 
     configure_builtin_sources(&mut engine, true);
+    use_client_environment(&mut engine);
 
     // Hooks
     engine.register_fn("register-hook!", register_hook);

@@ -66,6 +66,8 @@ FLAGS:
     --no-session                   Run a separate editor instead of joining the session
     --remote                       Open the files in the session's last used terminal and exit
     --wait                         With --remote, exit once none of the files is shown
+    --auto-save <ms>               Save this terminal's buffers <ms> after an edit and when the
+                                   terminal loses focus
     +[N]                           Open the first given file at line number N, or the last line, if
                                    N is not specified.
 ",
@@ -131,7 +133,7 @@ FLAGS:
         return Ok(1);
     }
 
-    let config = match Config::load_default() {
+    let mut config = match Config::load_default() {
         Ok(config) => config,
         Err(ConfigLoadError::Error(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             Config::default()
@@ -150,7 +152,7 @@ FLAGS:
     if args.session_server.is_none() {
         if let Some(key) = helix_term::session::session_key(&args, &config) {
             let launch_dir = launch_dir.context("couldn't determine the working directory")?;
-            return helix_term::session::run_client(&key, &args, launch_dir);
+            return helix_term::session::run_client(&key, &args, &config, launch_dir);
         }
     }
 
@@ -170,6 +172,10 @@ FLAGS:
     #[cfg(all(unix, not(feature = "integration")))]
     if let Some(key) = &args.session_server {
         return helix_term::application::serve(key, config, lang_loader, workspace_trust).await;
+    }
+
+    if let Some(timeout) = args.auto_save {
+        config.set_auto_save(timeout);
     }
 
     // TODO: use the thread local executor to spawn the application task separately from the work pool

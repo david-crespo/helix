@@ -36,7 +36,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use helix_view::{editor::SessionConfig, ClientId};
+use helix_view::{clipboard::ClipboardProvider, editor::SessionConfig, ClientId};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
@@ -83,10 +83,13 @@ pub struct Hello {
     pub env: Vec<(String, String)>,
     /// Whether a second file descriptor, the client's stdin, came with the terminal's.
     pub stdin_piped: bool,
+    /// The clipboard provider the client's config gives in its environment: the one it names, or
+    /// else the one Helix detects there.
+    pub clipboard_provider: ClipboardProvider,
 }
 
 impl Hello {
-    fn new(cwd: PathBuf, stdin_piped: bool) -> Self {
+    fn new(cwd: PathBuf, stdin_piped: bool, config: &Config) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             argv: std::env::args().collect(),
@@ -97,6 +100,7 @@ impl Hello {
                 })
                 .collect(),
             stdin_piped,
+            clipboard_provider: config.editor.clipboard_provider.clone(),
         }
     }
 
@@ -247,10 +251,10 @@ fn log_path(key: &str) -> PathBuf {
 
 /// Runs `hx` as a client of the session `key`'s server, starting the server if needed, and
 /// returns the exit code for this process.
-pub fn run_client(key: &str, args: &Args, cwd: PathBuf) -> anyhow::Result<i32> {
+pub fn run_client(key: &str, args: &Args, config: &Config, cwd: PathBuf) -> anyhow::Result<i32> {
     let path = socket_path(key)?;
     let conn = match UnixStream::connect(&path) {
-        Ok(conn) if args.remote => return run_remote(&conn, cwd),
+        Ok(conn) if args.remote => return run_remote(&conn, config, cwd),
         Ok(conn) => conn,
         // With no session to open them in, `--remote` files open here.
         Err(_) => {
@@ -275,7 +279,7 @@ pub fn run_client(key: &str, args: &Args, cwd: PathBuf) -> anyhow::Result<i32> {
         fds.push(stdin.as_fd());
     }
     send_fds(&conn, &fds)?;
-    write_message(&conn, &Hello::new(cwd, stdin_piped))?;
+    write_message(&conn, &Hello::new(cwd, stdin_piped, config))?;
 
     let mut resizes = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
     let resized = conn.try_clone()?;
@@ -324,9 +328,9 @@ pub fn run_client(key: &str, args: &Args, cwd: PathBuf) -> anyhow::Result<i32> {
 
 /// Has the server open this command line's files in its focused client, and waits for it to
 /// say it's done.
-fn run_remote(conn: &UnixStream, cwd: PathBuf) -> anyhow::Result<i32> {
+fn run_remote(conn: &UnixStream, config: &Config, cwd: PathBuf) -> anyhow::Result<i32> {
     send_fds(conn, &[])?;
-    write_message(conn, &Hello::new(cwd, false))?;
+    write_message(conn, &Hello::new(cwd, false, config))?;
     loop {
         match read_message(conn).context("the helix session server went away")? {
             ServerMessage::Error(message) => eprintln!("{message}"),

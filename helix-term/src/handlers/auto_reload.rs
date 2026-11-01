@@ -8,10 +8,10 @@ use std::time::{Duration, SystemTime};
 use helix_core::file_watcher::{events_from_paths, Event, EventType, FileSystemDidChange};
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_loader::workspace_trust::TrustQuery;
-use helix_view::editor::Config;
+use helix_view::editor::{Config, Severity};
 use helix_view::events::{ConfigDidChange, DocumentChangedOnDisk};
 use helix_view::handlers::{AutoReloadEvent, Handlers};
-use helix_view::{DocumentId, Editor};
+use helix_view::{ClientId, DocumentId, Editor};
 use tokio::time::Instant;
 
 use crate::compositor::Compositor;
@@ -59,7 +59,10 @@ impl ReloadHandler {
             return;
         }
         let prompt_if_modified = self.prompt_if_modified.load(atomic::Ordering::Relaxed);
-        job::dispatch_blocking(move |editor, compositor| {
+        // No client caused a change on disk, even when a client's focus set off the check: the
+        // reload and the document-changed-on-disk hook run as no client, and the messages go to
+        // the clients showing the document.
+        let reload = move |editor: &mut Editor, compositor: &mut Compositor| {
             let vcs_reload = fs_events
                 .iter()
                 .any(|fs_event| editor.diff_providers.needs_reload(fs_event));
@@ -85,7 +88,8 @@ impl ReloadHandler {
             if vcs_reload {
                 reload_vcs_diffs(editor);
             }
-        });
+        };
+        helix_event::client::sync_scope(None, || job::dispatch_blocking(reload));
     }
 }
 
@@ -218,7 +222,7 @@ fn handle_document_change(
             "auto-reload: {} was just written, waiting for it to settle",
             path.display()
         );
-        tokio::spawn(async move {
+        helix_event::client::spawn(async move {
             tokio::time::sleep(SETTLE).await;
             job::dispatch(move |editor, compositor| {
                 if editor.documents.contains_key(&doc_id) {
@@ -244,13 +248,22 @@ fn handle_document_change(
                     .relative_path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "[scratch]".into());
-                prompt_reload_modified(compositor, doc_id, path_str);
+                let client = prompt_client(editor, doc_id);
+                if client == editor.active_client() {
+                    prompt_reload_modified(compositor, doc_id, path_str);
+                } else {
+                    helix_event::client::sync_scope(Some(client), || {
+                        job::dispatch_blocking(move |_, compositor| {
+                            prompt_reload_modified(compositor, doc_id, path_str)
+                        })
+                    });
+                }
             } else {
                 let msg = format!(
                     "{} changed externally but has unsaved changes, use :reload to refresh",
                     doc.relative_path().unwrap().display()
                 );
-                editor.set_warning(msg);
+                notify(editor, doc_id, msg, Severity::Warning);
             }
         }
     } else {
@@ -262,7 +275,7 @@ fn handle_document_change(
                     "{} reloaded (external changes)",
                     doc.relative_path().unwrap().display()
                 );
-                editor.set_status(msg);
+                notify(editor, doc_id, msg, Severity::Info);
             }
             Err(err) => {
                 let doc = doc!(editor, &doc_id);
@@ -270,7 +283,7 @@ fn handle_document_change(
                     "{} auto-reload failed: {err}",
                     doc.relative_path().unwrap().display()
                 );
-                editor.set_error(msg);
+                notify(editor, doc_id, msg, Severity::Error);
             }
         }
     }
@@ -279,6 +292,34 @@ fn handle_document_change(
         editor,
         doc: doc_id,
     });
+}
+
+/// Shows a message about `doc_id` in the clients showing it, or if none does, in the active
+/// client, as a standalone editor shows it whichever buffer is open.
+fn notify(editor: &mut Editor, doc_id: DocumentId, msg: String, severity: Severity) {
+    let mut clients = editor.clients_showing(doc_id);
+    if clients.is_empty() {
+        clients.push(editor.active_client());
+    }
+    for client in clients {
+        let msg = msg.clone();
+        helix_event::client::sync_scope(Some(client), || {
+            editor.set_status_with_severity(msg, severity)
+        });
+    }
+}
+
+/// The one client to ask whether to reload `doc_id`: a client whose focused view shows it, else
+/// one showing it, else the active client. The active client comes first, which, as reloads run
+/// as no client, is the one that last had input.
+fn prompt_client(editor: &Editor, doc_id: DocumentId) -> ClientId {
+    let showing = editor.clients_showing(doc_id);
+    showing
+        .iter()
+        .find(|&&client| editor.client_focuses(client, doc_id))
+        .or(showing.first())
+        .copied()
+        .unwrap_or_else(|| editor.active_client())
 }
 
 /// Reload VCS diffs for all documents

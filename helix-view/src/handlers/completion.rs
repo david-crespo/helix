@@ -5,7 +5,7 @@ use helix_event::{send_blocking, TaskController};
 
 use crate::{document::SavePoint, DocumentId, ViewId};
 
-use tokio::sync::mpsc::Sender;
+use helix_event::Sender;
 
 pub struct CompletionHandler {
     event_tx: Sender<CompletionEvent>,

@@ -867,6 +867,15 @@ pub fn write_all_impl(
     cx: &mut compositor::Context,
     options: WriteAllOptions,
 ) -> anyhow::Result<()> {
+    write_docs_impl(cx, options, |_| true)
+}
+
+/// Saves the modified documents `include` picks, as [`write_all_impl`] saves all of them.
+pub fn write_docs_impl(
+    cx: &mut compositor::Context,
+    options: WriteAllOptions,
+    include: impl Fn(DocumentId) -> bool,
+) -> anyhow::Result<()> {
     let mut errors: Vec<&'static str> = Vec::new();
     let config = cx.editor.config();
     let saves: Vec<_> = cx
@@ -878,7 +887,7 @@ pub fn write_all_impl(
         .into_iter()
         .filter_map(|id| {
             let doc = doc!(cx.editor, &id);
-            if !doc.is_modified() {
+            if !doc.is_modified() || !include(id) {
                 return None;
             }
 

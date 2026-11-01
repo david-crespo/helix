@@ -1,4 +1,5 @@
 (require-builtin helix/core/editor as helix.)
+(require-builtin helix/core/misc as misc.)
 
 (provide register-hook)
 ;;@doc
@@ -27,6 +28,8 @@
 ;; * 'document-changed
 ;; * 'document-closed
 ;; * 'document-changed-on-disk
+;; * 'client-attached
+;; * 'client-detached
 ;;
 ;; Each of these expects a function with a slightly different signature to accept
 ;; the event payload.
@@ -109,6 +112,17 @@
 ;; reloaded, and a modified one is left as it was, so check `editor-document-dirty?`. Set
 ;; `editor.auto-reload.notify-if-modified = false` to replace the prompt or warning for modified
 ;; documents. Called once per change, once the file has gone 150ms without a write.
+;;
+;; ## client-attached
+;;
+;; Expects a function with one argument to accept the client that just joined a shared editor.
+;; It runs as that client. It doesn't run for the client that started the editor, since
+;; `init.scm` runs as that client starts.
+;;
+;; ## client-detached
+;;
+;; Expects a function with one argument to accept the client that just left a shared editor.
+;; It runs as the client that last had input.
 (define (register-hook event-kind callback-fn)
   (helix.register-hook event-kind callback-fn))
 
@@ -368,3 +382,77 @@
 
 (provide set-register!)
 (define set-register! helix.set-register!)
+;; Clients: with `editor.session = "auto"`, several terminals share one editor, each a client
+;; with its own layout, focus, mode and status line. Plugin code runs as one of them: keybindings
+;; and commands as the client that invoked them, hooks as the client that caused the event, and
+;; timers and callbacks as the client that set them up. Clients are integers. A standalone
+;; editor has one client.
+
+(provide current-client)
+;;@doc
+;;The client this code runs as. Functions like `editor-focus` and `set-status!` act on it.
+;;
+;;```scheme
+;;(current-client) -> int?
+;;```
+(define current-client helix.current-client)
+
+(provide editor-clients)
+;;@doc
+;;Every client of the editor.
+;;
+;;```scheme
+;;(editor-clients) -> (listof int?)
+;;```
+(define editor-clients helix.editor-clients)
+
+(provide client-views)
+;;@doc
+;;The views in a client's layout.
+;;
+;;```scheme
+;;(client-views client) -> (listof ViewId?)
+;;```
+(define client-views helix.client-views)
+
+(provide view->client)
+;;@doc
+;;The client whose layout holds a view, or `#false` if there's no such view.
+;;
+;;```scheme
+;;(view->client view) -> (or int? #false)
+;;```
+(define view->client helix.view->client)
+
+(provide with-client)
+;;@doc
+;;Calls `thunk` as `client` and returns its value. Code that runs with no client in mind, such as
+;;work on another thread handed back with `hx.with-context`, can use it to act on a particular
+;;client.
+;;
+;;```scheme
+;;(with-client client thunk) -> any?
+;;```
+;;
+;;```scheme
+;;(let ([client (current-client)])
+;;  (spawn-native-thread
+;;    (lambda ()
+;;      (hx.with-context (lambda () (with-client client (lambda () (set-status! "done"))))))))
+;;```
+(define (with-client client thunk)
+  (define previous #false)
+  (dynamic-wind (lambda () (set! previous (helix.set-current-client! client)))
+                thunk
+                (lambda () (helix.restore-current-client! previous))))
+
+(provide broadcast-status!)
+;;@doc
+;;Sets the status message of every client.
+;;
+;;```scheme
+;;(broadcast-status! message)
+;;```
+(define (broadcast-status! message)
+  (for-each (lambda (client) (with-client client (lambda () (misc.set-status! message))))
+            (editor-clients)))

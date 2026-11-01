@@ -85,7 +85,7 @@ fn request_document_colors(editor: &mut Editor, doc_id: DocumentId) {
         return;
     }
 
-    tokio::spawn(async move {
+    helix_event::client::spawn(async move {
         let mut all_colors = Vec::new();
         loop {
             match cancelable_future(futures.next(), &cancel).await {

@@ -380,7 +380,7 @@ impl Editor {
             return;
         };
 
-        tokio::spawn(async move {
+        helix_event::client::spawn(async move {
             if let Err(err) = future.await {
                 log::error!("Error executing LSP command: {err}");
             }

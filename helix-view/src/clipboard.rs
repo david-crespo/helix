@@ -31,6 +31,18 @@ pub enum ClipboardError {
 
 type Result<T> = std::result::Result<T, ClipboardError>;
 
+/// Where the termcode provider writes, when it isn't stdout.
+static TERMINAL: std::sync::Mutex<Option<Box<dyn std::io::Write + Send>>> =
+    std::sync::Mutex::new(None);
+
+/// Replaces the terminal the termcode provider writes OSC 52 sequences to. A server with several
+/// clients swaps in the active client's terminal. `None` means stdout.
+pub fn swap_terminal(
+    terminal: Option<Box<dyn std::io::Write + Send>>,
+) -> Option<Box<dyn std::io::Write + Send>> {
+    std::mem::replace(&mut TERMINAL.lock().unwrap(), terminal)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use external::ClipboardProvider;
 #[cfg(target_arch = "wasm32")]
@@ -301,9 +313,18 @@ mod external {
                     };
                     // NOTE: it would be ideal to have the terminal execute this but it _should_
                     // work to send this over stdout instead.
-                    let mut stdout = std::io::stdout().lock();
-                    write!(stdout, "{}", Osc::SetSelection(selection, content))?;
-                    stdout.flush()?;
+                    let osc = Osc::SetSelection(selection, content).to_string();
+                    let mut terminal = TERMINAL.lock().unwrap();
+                    let mut stdout;
+                    let out: &mut dyn Write = match &mut *terminal {
+                        Some(terminal) => terminal,
+                        None => {
+                            stdout = std::io::stdout().lock();
+                            &mut stdout
+                        }
+                    };
+                    out.write_all(osc.as_bytes())?;
+                    out.flush()?;
                     Ok(())
                 }
                 Self::Custom(command_provider) => match clipboard_type {
@@ -419,7 +440,9 @@ mod external {
         let stdin = input.map(|_| Stdio::piped()).unwrap_or_else(Stdio::null);
         let stdout = pipe_output.then(Stdio::piped).unwrap_or_else(Stdio::null);
 
-        let mut command: Command = Command::new(cmd.command.as_ref());
+        // With the environment of the client that copies or pastes, which picks its display
+        // or tmux server.
+        let mut command: Command = helix_stdx::env::command(cmd.command.as_ref());
 
         #[allow(unused_mut)]
         let mut command_mut: &mut Command = command

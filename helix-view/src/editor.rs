@@ -1,9 +1,7 @@
 use crate::{
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
     clipboard::ClipboardProvider,
-    document::{
-        DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
-    },
+    document::{DocumentOpenError, DocumentSavedEventResult, Mode, SavePoint},
     events::{DocumentDidClose, DocumentDidOpen, DocumentFocusLost, DocumentSaved},
     graphics::{CursorKind, Rect},
     handlers::Handlers,
@@ -856,6 +854,9 @@ pub enum StatusLineElement {
     /// An indicator that shows `"[readonly]"` when a file cannot be written
     ReadOnlyIndicator,
 
+    /// An indicator that shows `"[auto-save]"` when edits to the file are saved after a delay
+    AutoSaveIndicator,
+
     /// The file encoding
     FileEncoding,
 
@@ -1411,9 +1412,13 @@ pub struct Editor {
 
     // We Flatten<> to resolve the inner DocumentSavedEventFuture. For that we need a stream of streams, hence the Once<>.
     // https://stackoverflow.com/a/66875668
-    pub saves: HashMap<DocumentId, UnboundedSender<Once<DocumentSavedEventFuture>>>,
-    pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
-    pub write_count: usize,
+    pub saves: HashMap<DocumentId, UnboundedSender<Once<ClientSave>>>,
+    pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<ClientSave>>>>,
+    /// The client of each save in `save_queue`.
+    pub pending_saves: Vec<Option<ClientId>>,
+    /// Saves of other clients that finished while [`Editor::flush_writes`] waited, for the event
+    /// loop to report to their own client.
+    finished_saves: VecDeque<(Option<ClientId>, DocumentSavedEventResult)>,
 
     pub count: Option<std::num::NonZeroUsize>,
     pub selected_register: Option<char>,
@@ -1482,6 +1487,8 @@ pub struct Editor {
 
     /// The state of every client but the active one. See [`ClientState`].
     parked_clients: HashMap<ClientId, ClientState>,
+    /// The `--auto-save` delay of each session client that passed it.
+    pub client_auto_save: HashMap<ClientId, u64>,
 }
 
 /// Editor state that belongs to one client. The active client's state lives in `Editor`'s own
@@ -1509,10 +1516,17 @@ pub struct ClientState {
     cwd: Option<PathBuf>,
     /// Swapped into [`helix_stdx::env::command`]'s environment.
     env: Option<helix_stdx::env::Environment>,
+    /// Swapped into [`Registers::client_clipboard`].
+    clipboard: Option<ClipboardProvider>,
 }
 
 impl ClientState {
-    pub fn new(theme: Theme, cwd: PathBuf, env: helix_stdx::env::Environment) -> Self {
+    pub fn new(
+        theme: Theme,
+        cwd: PathBuf,
+        env: helix_stdx::env::Environment,
+        clipboard: ClipboardProvider,
+    ) -> Self {
         Self {
             mode: Mode::Normal,
             count: None,
@@ -1533,6 +1547,7 @@ impl ClientState {
             cursor_cache: CursorCache::default(),
             cwd: Some(cwd),
             env: Some(env),
+            clipboard: Some(clipboard),
         }
     }
 
@@ -1556,6 +1571,7 @@ impl ClientState {
         swap(&mut self.exit_code, &mut editor.exit_code);
         swap(&mut self.mouse_down_range, &mut editor.mouse_down_range);
         swap(&mut self.cursor_cache, &mut editor.cursor_cache);
+        swap(&mut self.clipboard, &mut editor.registers.client_clipboard);
         self.cwd = helix_stdx::env::swap_current_working_dir(self.cwd.take());
         self.env = helix_stdx::env::swap_environment(self.env.take());
     }
@@ -1571,9 +1587,14 @@ pub struct ClippingConfiguration {
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
 
+/// A save's result, with the client that asked for it.
+pub type ClientSave =
+    futures_util::future::BoxFuture<'static, (Option<ClientId>, DocumentSavedEventResult)>;
+
 #[derive(Debug)]
 pub enum EditorEvent {
-    DocumentSaved(DocumentSavedEventResult),
+    /// A save finished, for the client that asked for it.
+    DocumentSaved(Option<ClientId>, DocumentSavedEventResult),
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
     DebuggerEvent((DebugAdapterId, dap::Payload)),
@@ -1666,7 +1687,8 @@ impl Editor {
             documents: BTreeMap::new(),
             saves: HashMap::new(),
             save_queue: SelectAll::new(),
-            write_count: 0,
+            pending_saves: Vec::new(),
+            finished_saves: VecDeque::new(),
             count: None,
             selected_register: None,
             macro_recording: None,
@@ -1705,6 +1727,7 @@ impl Editor {
             workspace_trust,
             file_watcher,
             parked_clients: HashMap::new(),
+            client_auto_save: HashMap::new(),
         }
     }
 
@@ -1718,13 +1741,52 @@ impl Editor {
         self.tree.clients()
     }
 
+    /// The clients with a view that has opened `doc`, which has it among their buffers. A
+    /// client with several such views comes up once for each.
+    pub fn clients_with<'a>(&'a self, doc: &'a Document) -> impl Iterator<Item = ClientId> + 'a {
+        doc.selections()
+            .keys()
+            .map(|&view| self.tree.client_of(view))
+    }
+
+    /// The clients with a view showing `doc`, the active one first.
+    pub fn clients_showing(&self, doc: DocumentId) -> Vec<ClientId> {
+        self.clients()
+            .filter(|&client| {
+                self.tree
+                    .views()
+                    .any(|(view, _)| view.doc == doc && self.tree.client_of(view.id) == client)
+            })
+            .collect()
+    }
+
+    /// Whether `client`'s focused view shows `doc`.
+    pub fn client_focuses(&self, client: ClientId, doc: DocumentId) -> bool {
+        let focus = self.tree.client_focus(client);
+        self.tree.try_get(focus).is_some_and(|view| view.doc == doc)
+    }
+
     /// Whether a view of another client has opened `doc`, so it stays among that client's
     /// buffers once the active client leaves.
     pub fn open_in_other_clients(&self, doc: &Document) -> bool {
         let active = self.active_client();
-        doc.selections()
-            .keys()
-            .any(|&view| self.tree.client_of(view) != active)
+        self.clients_with(doc).any(|client| client != active)
+    }
+
+    /// How long after an edit `client` saves the buffers it has open, if it auto-saves: its
+    /// `--auto-save` delay, or the configured one.
+    pub fn auto_save_delay(&self, client: ClientId) -> Option<u64> {
+        let config = &self.config().auto_save.after_delay;
+        let configured = config.enable.then_some(config.timeout);
+        self.client_auto_save.get(&client).copied().or(configured)
+    }
+
+    /// How long after an edit `doc` is saved: the shortest delay of the clients that have it
+    /// open and auto-save. `None` if none of them does.
+    pub fn doc_auto_save_delay(&self, doc: &Document) -> Option<u64> {
+        self.clients_with(doc)
+            .filter_map(|client| self.auto_save_delay(client))
+            .min()
     }
 
     /// Adds a client with an empty layout. It stays inactive until [`Editor::activate`].
@@ -1740,12 +1802,13 @@ impl Editor {
         }
         self.tree.remove_client(client);
         self.parked_clients.remove(&client);
+        self.client_auto_save.remove(&client);
         self.share_highlight_scopes();
     }
 
     /// Makes `client` the active one: swaps its state into the editor's fields and its layout
-    /// into the tree. Only the event loop and the callback dispatcher should call this, so that
-    /// work always runs as the client that caused it.
+    /// into the tree. Only the event loop, the callback dispatcher and Steel's `with-client`
+    /// should call this, so that work always runs as the client that caused it.
     pub fn activate(&mut self, client: ClientId) {
         let active = self.active_client();
         if client == active {
@@ -1839,29 +1902,57 @@ impl Editor {
             .reset(Instant::now() + config.idle_timeout);
     }
 
+    /// Sets the status line of the client the running work is for (see [`helix_event::client`]).
+    /// Work no client caused, such as a language server's, sets every client's. Work for a client
+    /// that has gone sets nothing.
+    fn route_status(&mut self, msg: Option<(Cow<'static, str>, Severity)>) {
+        match helix_event::client::current() {
+            None => {
+                for state in self.parked_clients.values_mut() {
+                    state.status_msg.clone_from(&msg);
+                }
+                self.status_msg = msg;
+            }
+            Some(client) if client == self.active_client() => self.status_msg = msg,
+            Some(client) => {
+                if let Some(state) = self.parked_clients.get_mut(&client) {
+                    state.status_msg = msg;
+                }
+            }
+        }
+    }
+
     pub fn clear_status(&mut self) {
-        self.status_msg = None;
+        self.route_status(None);
+    }
+
+    pub fn set_status_with_severity(
+        &mut self,
+        status: impl Into<Cow<'static, str>>,
+        severity: Severity,
+    ) {
+        self.route_status(Some((status.into(), severity)));
     }
 
     #[inline]
     pub fn set_status<T: Into<Cow<'static, str>>>(&mut self, status: T) {
         let status = status.into();
         log::debug!("editor status: {}", status);
-        self.status_msg = Some((status, Severity::Info));
+        self.route_status(Some((status, Severity::Info)));
     }
 
     #[inline]
     pub fn set_error<T: Into<Cow<'static, str>>>(&mut self, error: T) {
         let error = error.into();
         log::debug!("editor error: {}", error);
-        self.status_msg = Some((error, Severity::Error));
+        self.route_status(Some((error, Severity::Error)));
     }
 
     #[inline]
     pub fn set_warning<T: Into<Cow<'static, str>>>(&mut self, warning: T) {
         let warning = warning.into();
         log::warn!("editor warning: {}", warning);
-        self.status_msg = Some((warning, Severity::Warning));
+        self.route_status(Some((warning, Severity::Warning)));
     }
 
     #[inline]
@@ -2585,6 +2676,7 @@ impl Editor {
         let watched = save_path
             .as_deref()
             .is_some_and(|path| self.file_watcher.is_watching(path));
+        let client = helix_event::client::current();
         let future = async move {
             let res = doc_save_future.await;
             if !watched {
@@ -2592,7 +2684,7 @@ impl Editor {
                     handler.file_changed(event.path.clone());
                 }
             }
-            res
+            (client, res)
         };
 
         use futures_util::stream;
@@ -2603,7 +2695,7 @@ impl Editor {
             .send(stream::once(Box::pin(future)))
             .map_err(|err| anyhow!("failed to send save event: {}", err))?;
 
-        self.write_count += 1;
+        self.pending_saves.push(client);
 
         dispatch(DocumentSaved {
             editor: self,
@@ -2812,13 +2904,16 @@ impl Editor {
     pub async fn wait_event(&mut self) -> EditorEvent {
         // the loop only runs once or twice and would be better implemented with a recursion + const generic
         // however due to limitations with async functions that can not be implemented right now
+        if let Some((client, event)) = self.finished_saves.pop_front() {
+            return EditorEvent::DocumentSaved(client, event);
+        }
         loop {
             tokio::select! {
                 biased;
 
-                Some(event) = self.save_queue.next() => {
-                    self.write_count -= 1;
-                    return EditorEvent::DocumentSaved(event)
+                Some((client, event)) = self.save_queue.next() => {
+                    self.finish_save(client);
+                    return EditorEvent::DocumentSaved(client, event)
                 }
                 Some(config_event) = self.config_events.1.recv() => {
                     return EditorEvent::ConfigEvent(config_event)
@@ -2851,15 +2946,31 @@ impl Editor {
         }
     }
 
+    fn finish_save(&mut self, client: Option<ClientId>) {
+        if let Some(i) = self.pending_saves.iter().position(|&c| c == client) {
+            self.pending_saves.swap_remove(i);
+        }
+    }
+
+    /// Waits for pending saves, as quitting must: those of the current client and of no client,
+    /// or with no current client, all of them. Saves of other clients that finish meanwhile are
+    /// left for the event loop to report to their own client.
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {
-        while self.write_count > 0 {
-            if let Some(save_event) = self.save_queue.next().await {
-                self.write_count -= 1;
+        let current = helix_event::client::current();
+        let other =
+            |client: Option<ClientId>| client.is_some() && current.is_some() && client != current;
+        while self.pending_saves.iter().any(|&client| !other(client)) {
+            if let Some((client, save_event)) = self.save_queue.next().await {
+                self.finish_save(client);
+                if other(client) {
+                    self.finished_saves.push_back((client, save_event));
+                    continue;
+                }
 
                 let save_event = match save_event {
                     Ok(event) => event,
                     Err(err) => {
-                        self.set_error(err.to_string());
+                        helix_event::client::sync_scope(client, || self.set_error(err.to_string()));
                         bail!(err);
                     }
                 };

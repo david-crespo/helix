@@ -29,6 +29,9 @@ pub struct Args {
     pub remote: bool,
     /// With `remote`, wait until none of the files is shown.
     pub wait: bool,
+    /// Save this client's buffers this many milliseconds after an edit, and when its terminal
+    /// loses focus.
+    pub auto_save: Option<u64>,
 }
 
 impl Args {
@@ -95,6 +98,10 @@ impl Args {
                 "--no-session" => args.no_session = true,
                 "--remote" => args.remote = true,
                 "--wait" => args.wait = true,
+                "--auto-save" => match argv.next().map(|ms| ms.parse()) {
+                    Some(Ok(ms)) => args.auto_save = Some(ms),
+                    _ => anyhow::bail!("--auto-save must specify a delay in milliseconds"),
+                },
                 "--session-server" => match argv.next() {
                     Some(key) => args.session_server = Some(key),
                     None => anyhow::bail!("--session-server must specify a session key"),

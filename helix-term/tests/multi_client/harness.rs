@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -61,12 +61,7 @@ impl Env {
         ] {
             fs::create_dir_all(env.root().join(dir)).unwrap();
         }
-        // Keys are sent in legacy encoding. Without this, Helix would try to negotiate the
-        // kitty keyboard protocol with a terminal that can't answer.
-        env.write_abs(
-            "home/.config/helix/config.toml",
-            "[editor]\nkitty-keyboard-protocol = \"disabled\"\nsession = \"auto\"\n",
-        );
+        env.editor_config("");
         let languages = languages.replace("{root}", &env.root().display().to_string());
         env.write_abs("home/.config/helix/languages.toml", &languages);
         env
@@ -93,6 +88,24 @@ impl Env {
 
     fn write_abs(&self, rel: &str, contents: &str) {
         fs::write(self.root().join(rel), contents).unwrap();
+    }
+
+    /// Writes a file in the user's config directory, such as Steel's `init.scm`.
+    #[cfg(feature = "steel")]
+    pub fn config_file(&self, name: &str, contents: &str) {
+        self.write_abs(&format!("home/.config/helix/{name}"), contents);
+    }
+
+    /// Writes the user's `config.toml`, with `toml` added to its `[editor]` table.
+    pub fn editor_config(&self, toml: &str) {
+        // Keys are sent in legacy encoding. Without this, Helix would try to negotiate the
+        // kitty keyboard protocol with a terminal that can't answer.
+        self.write_abs(
+            "home/.config/helix/config.toml",
+            &format!(
+                "[editor]\nkitty-keyboard-protocol = \"disabled\"\nsession = \"auto\"\n{toml}"
+            ),
+        );
     }
 
     /// Adds a theme to the user's config.
@@ -196,11 +209,15 @@ impl Env {
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(nz(ROWS), nz(COLS), 0)));
+        let output = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let stopped = Arc::new((Mutex::new(false), Condvar::new()));
         let mut reader = pair.master.try_clone_reader().unwrap();
         {
             let parser = parser.clone();
+            let output = output.clone();
             let writer = writer.clone();
+            let stopped = stopped.clone();
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut tail = Vec::new();
@@ -208,6 +225,7 @@ impl Env {
                     if n == 0 {
                         break;
                     }
+                    output.lock().unwrap().extend_from_slice(&buf[..n]);
                     let mut parser = parser.lock().unwrap();
                     parser.process(&buf[..n]);
                     // Answer the queries Helix waits on at startup. The tail catches a query
@@ -221,6 +239,9 @@ impl Env {
                     }
                     let keep = tail.len().saturating_sub(8);
                     tail.drain(..keep);
+                    drop(parser);
+                    let (stopped, resumed) = &*stopped;
+                    drop(resumed.wait_while(stopped.lock().unwrap(), |stopped| *stopped));
                 }
             });
         }
@@ -230,6 +251,8 @@ impl Env {
             master: pair.master,
             writer,
             parser,
+            output,
+            stopped,
         }
     }
 }
@@ -275,6 +298,10 @@ pub struct Client {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Everything the terminal received, including what the screen doesn't show.
+    output: Arc<Mutex<Vec<u8>>>,
+    /// Whether the terminal has stopped reading its program's output, and its resumption.
+    stopped: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Client {
@@ -343,6 +370,12 @@ impl Client {
         })
     }
 
+    /// Whether the terminal has received `bytes`, such as an escape sequence.
+    pub fn received(&self, bytes: &[u8]) -> bool {
+        let output = self.output.lock().unwrap();
+        output.windows(bytes.len()).any(|window| window == bytes)
+    }
+
     /// The status line, the second row from the bottom.
     pub fn status_line(&self) -> String {
         let (rows, _) = self.parser.lock().unwrap().screen().size();
@@ -404,6 +437,13 @@ impl Client {
         }
     }
 
+    /// Stops the terminal reading what its program writes, as a stalled SSH session would,
+    /// until the returned guard is dropped. Writes to it block once the pty's buffer is full.
+    pub fn stop_reading(&self) -> Stalled {
+        *self.stopped.0.lock().unwrap() = true;
+        Stalled(self.stopped.clone())
+    }
+
     /// Sends SIGHUP to the client's process group, as closing its terminal would.
     pub fn hang_up(&self) {
         let group = format!("-{}", self.pid());
@@ -427,6 +467,15 @@ impl Client {
                 pixel_height: 0,
             })
             .unwrap();
+    }
+}
+
+pub struct Stalled(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for Stalled {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap() = false;
+        self.0 .1.notify_all();
     }
 }
 

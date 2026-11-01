@@ -20,7 +20,7 @@ impl Application {
         !self.editor.should_close()
     }
 
-    pub(super) fn is_suspended(&self) -> bool {
+    pub(super) fn skips_frames(&self) -> bool {
         false
     }
 }

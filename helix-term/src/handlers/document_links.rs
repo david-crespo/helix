@@ -93,7 +93,7 @@ fn request_document_links(editor: &mut Editor, doc_id: DocumentId) {
         return;
     }
 
-    tokio::spawn(async move {
+    helix_event::client::spawn(async move {
         let mut all_links = Vec::new();
         loop {
             match cancelable_future(futures.next(), &cancel).await {

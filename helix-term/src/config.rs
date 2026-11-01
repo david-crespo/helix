@@ -1,13 +1,21 @@
 use crate::keymap;
 use crate::keymap::{merge_keys, KeyTrie};
 use helix_loader::merge_toml_values;
-use helix_view::{document::Mode, theme};
+use helix_view::{
+    document::Mode,
+    editor::{AutoSave, AutoSaveAfterDelay},
+    theme,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
 use std::io::Error as IOError;
+use std::sync::OnceLock;
 use toml::de::Error as TomlError;
+
+/// The `--auto-save` delay of a standalone editor.
+static AUTO_SAVE: OnceLock<u64> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -117,7 +125,29 @@ impl Config {
         Ok(res)
     }
 
+    /// Loads the config files, with `--auto-save` over them in a standalone editor.
     pub fn load_default() -> Result<Config, ConfigLoadError> {
+        let mut config = Self::load_files()?;
+        if let Some(&timeout) = AUTO_SAVE.get() {
+            config.set_auto_save(timeout);
+        }
+        Ok(config)
+    }
+
+    /// Applies `--auto-save` to this config, and to the ones loaded from now on, as setting
+    /// `[editor.auto-save]` would.
+    pub fn set_auto_save(&mut self, timeout: u64) {
+        let _ = AUTO_SAVE.set(timeout);
+        self.editor.auto_save = AutoSave {
+            focus_lost: true,
+            after_delay: AutoSaveAfterDelay {
+                enable: true,
+                timeout,
+            },
+        };
+    }
+
+    fn load_files() -> Result<Config, ConfigLoadError> {
         let global_config =
             fs::read_to_string(helix_loader::config_file()).map_err(ConfigLoadError::Error)?;
         let local_config = fs::read_to_string(helix_loader::workspace_config_file())

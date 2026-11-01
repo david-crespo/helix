@@ -291,6 +291,34 @@ is then run, and the value returned back to this thread of control.
 
 There is also `hx.with-context` which does a similar thing, except it does _not_ block the current thread.
 
+### Multiple clients
+
+With `editor.session = "auto"`, every `hx` in a workspace joins one shared editor. Each terminal is a client with its own layout, focus, mode, status line and theme, while documents, registers and the Steel runtime are shared. Plugin code always runs as one client, and functions like `editor-focus`, `editor-mode`, `set-status!` and `push-component!` act on that client:
+
+* Keybindings, typed commands and components run as the client that invoked or shows them.
+* Hooks run as the client that caused the event, such as the one whose edit fired `document-changed`. Events no client caused, such as those from language servers, run as the client that last had input.
+* Timers and callbacks (`enqueue-thread-local-callback`, `await-callback` and the like) run as the client that set them up. If it has left by then, they run as the client that last had input, but what they do to the UI, such as pushing a component, is dropped. Those set up by `init.scm` follow whichever client last had input.
+* Work handed back from another thread with `hx.with-context` runs as the client that last had input. Use `with-client` to pick one.
+
+A standalone editor has a single client, so none of this changes anything there. These functions in `helix/editor.scm` deal with clients, which are integers:
+
+* `(current-client)`: the client this code runs as.
+* `(editor-clients)`: every client.
+* `(client-views client)`: the views in a client's layout.
+* `(view->client view)`: the client whose layout holds a view.
+* `(with-client client thunk)`: calls `thunk` as `client`.
+* `(broadcast-status! message)`: sets every client's status message.
+
+The `client-attached` and `client-detached` hooks run when a terminal joins or leaves, with the client as their argument. The session's first client never attaches, since `init.scm` runs as it starts.
+
+```scheme
+(require "helix/editor.scm")
+(require "helix/misc.scm")
+
+(register-hook 'client-attached
+               (lambda (client) (broadcast-status! (string-append "client " (number->string client) " joined"))))
+```
+
 ### Components
 
 Coming soon!

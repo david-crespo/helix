@@ -125,6 +125,8 @@ impl ScriptingEngine {
                 .ok();
         }
 
+        // Startup scripts run as no client, so the timers they set follow focus.
+        helix_event::client::set_current(None);
         for kind in plugins() {
             manual_dispatch!(
                 kind,

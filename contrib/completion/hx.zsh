@@ -26,6 +26,7 @@ _hx() {
 		"--no-session[Run a separate editor even if sessions are on]" \
 		"--remote[Open the files in the session's last used terminal and exit]" \
 		"--wait[With --remote, exit once none of the files is shown]" \
+		"--auto-save[Save this terminal's buffers <ms> after an edit and on focus lost]:ms:" \
 		"*:file:_files"
 
 	case "$state" in

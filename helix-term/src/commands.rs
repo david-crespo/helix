@@ -1566,7 +1566,7 @@ fn open_url_in_callback(
     rel_path: &Path,
 ) {
     if should_open_url_externally(&url) {
-        tokio::spawn(async move {
+        helix_event::client::spawn(async move {
             match crate::open_external_url_callback(url).await {
                 Ok(callback) => job::dispatch_callback(callback).await,
                 Err(err) => status::report(err).await,
@@ -5389,7 +5389,7 @@ fn format_selections(cx: &mut Context) {
     let doc_id = doc.id();
     let doc_version = doc.version();
 
-    tokio::spawn(async move {
+    helix_event::client::spawn(async move {
         match future.await {
             Ok(Some(res)) => {
                 let transaction =
@@ -6715,7 +6715,7 @@ async fn shell_impl_async(
         }
     };
     let output = if let Some(mut stdin) = process.stdin.take() {
-        let input_task = tokio::spawn(async move {
+        let input_task = helix_event::client::spawn(async move {
             if let Some(input) = input {
                 helix_view::document::to_writer(&mut stdin, (encoding::UTF_8, false), &input)
                     .await?;

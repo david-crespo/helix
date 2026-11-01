@@ -108,6 +108,8 @@ struct ClientUi {
     compositor: Compositor,
     terminal: Terminal,
     theme_mode: Option<theme::Mode>,
+    /// The terminal OSC 52 clipboard copies go to. See [`helix_view::clipboard::swap_terminal`].
+    clipboard: Option<Box<dyn std::io::Write + Send>>,
 }
 
 #[cfg(feature = "integration")]
@@ -340,32 +342,52 @@ impl Application {
         Box::new(ui::EditorView::new(Keymaps::new(keys)))
     }
 
-    /// Makes `client` the active one, in the editor and here. Returns false if it's gone.
+    /// Makes `client` the active one, in the editor and here, and the one work runs as.
+    /// Returns false if it's gone.
     fn activate(&mut self, client: ClientId) -> bool {
         let active = self.editor.active_client();
-        if client == active {
-            return true;
+        if client != active {
+            let Some(mut ui) = self.parked.remove(&client) else {
+                return false;
+            };
+            std::mem::swap(&mut self.compositor, &mut ui.compositor);
+            std::mem::swap(&mut self.terminal, &mut ui.terminal);
+            std::mem::swap(&mut self.theme_mode, &mut ui.theme_mode);
+            ui.clipboard = helix_view::clipboard::swap_terminal(ui.clipboard.take());
+            self.parked.insert(active, ui);
+            self.editor.activate(client);
+            #[cfg(feature = "steel")]
+            crate::commands::engine::steel::install_event_reader(
+                crate::commands::engine::TerminalEventReaderHandle::new(self.terminal.backend()),
+            );
         }
-        let Some(mut ui) = self.parked.remove(&client) else {
-            return false;
-        };
-        std::mem::swap(&mut self.compositor, &mut ui.compositor);
-        std::mem::swap(&mut self.terminal, &mut ui.terminal);
-        std::mem::swap(&mut self.theme_mode, &mut ui.theme_mode);
-        self.parked.insert(active, ui);
-        self.editor.activate(client);
-        self.jobs.client = client;
+        helix_event::client::set_current(Some(client));
         true
+    }
+
+    /// Activates the client that work, such as a callback, is for. Work that no client caused
+    /// runs in the focused client's UI, as no client. Work for a client that has gone runs there
+    /// too, as that client, so its status messages are dropped. Returns false if the client is
+    /// gone.
+    fn run_as(&mut self, client: Option<ClientId>) -> bool {
+        let alive = client.is_none_or(|client| self.activate(client));
+        if client.is_none() || !alive {
+            self.activate(self.focused);
+            helix_event::client::set_current(client);
+        }
+        alive
     }
 
     /// Runs `f` once as each client.
     fn for_each_client(&mut self, mut f: impl FnMut(&mut Self)) {
         let active = self.editor.active_client();
+        let current = helix_event::client::current();
         for client in self.editor.clients().collect::<Vec<_>>() {
             self.activate(client);
             f(self);
         }
         self.activate(active);
+        helix_event::client::set_current(current);
     }
 
     /// The progress spinner for `server_id` in every client's editor view.
@@ -389,7 +411,7 @@ impl Application {
                 job::Callback::EditorCompositor(_) | job::Callback::EditorCompositorJobs(_)
             ))
         );
-        if !self.activate(client.unwrap_or(self.focused)) && needs_ui {
+        if !self.run_as(client) && needs_ui {
             return;
         }
         if let Some(job) =
@@ -407,8 +429,8 @@ impl Application {
     }
 
     fn render_client(&mut self) {
-        // A client that just quit, or is suspended, has nothing to show.
-        if self.editor.tree.is_empty() || self.is_suspended() {
+        // A client that just quit has nothing to show.
+        if self.editor.tree.is_empty() || self.skips_frames() {
             return;
         }
         if self.compositor.full_redraw {
@@ -464,6 +486,10 @@ impl Application {
             if !self.update_clients() {
                 return false;
             }
+            // Between events, the focused client is the active one. Each event below runs as the
+            // client it's for, if any.
+            debug_assert_eq!(self.editor.active_client(), self.focused);
+            self.run_as(None);
 
             use futures_util::StreamExt;
 
@@ -486,7 +512,7 @@ impl Application {
                 Some((client, callback)) = self.jobs.callbacks.recv() => {
                     self.handle_callback(client, Ok(Some(callback))).await;
                 }
-                Some(msg) = self.jobs.status_messages.recv() => {
+                Some((client, msg)) = self.jobs.status_messages.recv() => {
                     let severity = match msg.severity{
                         helix_event::status::Severity::Hint => Severity::Hint,
                         helix_event::status::Severity::Info => Severity::Info,
@@ -494,17 +520,24 @@ impl Application {
                         helix_event::status::Severity::Error => Severity::Error,
                     };
                     // TODO: show multiple status messages at once to avoid clobbering
-                    self.editor.status_msg = Some((msg.message, severity));
+                    helix_event::client::sync_scope(client, || {
+                        self.editor.set_status_with_severity(msg.message, severity)
+                    });
                     helix_event::request_redraw();
                 }
                 Some((client, callback)) = self.jobs.wait_futures.next() => {
-                    self.handle_callback(Some(client), callback).await;
+                    self.handle_callback(client, callback).await;
                 }
                 Some((client, callback)) = self.jobs.local_futures.next() => {
-                    // Plugin callbacks, such as timers, outlive the client that set them up, so
-                    // they run as the focused client once theirs is gone.
-                    self.activate(client);
-                    self.jobs.handle_local_callback(&mut self.editor, &mut self.compositor, callback);
+                    if self.run_as(client) {
+                        self.jobs.handle_local_callback(&mut self.editor, &mut self.compositor, callback);
+                    } else {
+                        // Plugin callbacks, such as timers, outlive the client that set them
+                        // up. Once it's gone they still run, but what they do to its UI, such
+                        // as pushing a component, is dropped.
+                        let mut compositor = Compositor::new(self.compositor.size());
+                        self.jobs.handle_local_callback(&mut self.editor, &mut compositor, callback);
+                    }
                     self.activate(self.focused);
                     self.render().await;
                 }
@@ -517,7 +550,7 @@ impl Application {
                         // set in `handle_document_write`) can run before the `DocumentSavedEvent` is processed. Slow file I/O on Windows
                         // (atomic_save's rename/fsync dance over the still-open temp file) makes this race observable.
                         // Errors produce an event too, so it cannot hang.
-                        if _idle_handled && self.editor.write_count == 0 {
+                        if _idle_handled && self.editor.pending_saves.is_empty() {
                             return true;
                         }
                     }
@@ -874,8 +907,10 @@ impl Application {
         log::debug!("received editor event: {:?}", event);
 
         match event {
-            EditorEvent::DocumentSaved(event) => {
+            EditorEvent::DocumentSaved(client, event) => {
+                self.run_as(client);
                 self.handle_document_write(event);
+                self.activate(self.focused);
                 self.render().await;
             }
             EditorEvent::ConfigEvent(event) => {
@@ -897,6 +932,8 @@ impl Application {
                 self.render().await;
             }
             EditorEvent::IdleTimer => {
+                // The idle timer restarts on input, so it's the focused client's.
+                self.activate(self.focused);
                 self.editor.clear_idle_timer();
                 self.handle_idle_timeout().await;
 
@@ -1618,16 +1655,21 @@ impl Application {
         //        errors along the way
         let mut errs = Vec::new();
 
-        if let Err(err) = self
-            .jobs
-            .finish(&mut self.editor, Some(&mut self.compositor))
-            .await
-        {
-            log::error!("Error executing job: {}", err);
-            errs.push(err);
-        };
+        // Each client's jobs finish with its own UI.
+        for client in self.editor.clients().collect::<Vec<_>>() {
+            self.activate(client);
+            if let Err(err) = self
+                .jobs
+                .finish(&mut self.editor, Some(&mut self.compositor))
+                .await
+            {
+                log::error!("Error executing job: {}", err);
+                errs.push(err);
+            };
+        }
 
-        if let Err(err) = self.editor.flush_writes().await {
+        // As no client, so it waits for every client's saves.
+        if let Err(err) = helix_event::client::scope(None, self.editor.flush_writes()).await {
             log::error!("Error writing: {}", err);
             errs.push(err);
         }

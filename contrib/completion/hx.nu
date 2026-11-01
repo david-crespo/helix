@@ -29,5 +29,6 @@ export extern hx [
     --no-session,                               # Run a separate editor instead of joining the session
     --remote,                                   # Open the files in the session's last used terminal and exit
     --wait,                                     # With --remote, exit once none of the files is shown
+    --auto-save: int,                           # Save this terminal's buffers <ms> after an edit and on focus lost
     ...files: glob,                             # Sets the input file to use, position can also be specified via file[:row[:col]]
 ]

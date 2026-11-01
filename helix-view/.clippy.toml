@@ -1,0 +1,6 @@
+# Several clients can share one editor. These keep the client a task is for, so what it sends
+# back reaches that client. See `helix_event::client`.
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "use helix_event::client::spawn" },
+    { path = "tokio::task::spawn_blocking", reason = "use helix_event::client::spawn_blocking" },
+]

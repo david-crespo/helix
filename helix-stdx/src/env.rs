@@ -94,6 +94,25 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     command
 }
 
+/// The environment [`command`] gives programs, if it isn't this process's own: in a server,
+/// the active client's.
+pub fn environment() -> Option<Environment> {
+    ENVIRONMENT.read().unwrap().clone()
+}
+
+/// An environment variable as [`command`] gives it to programs: in a server, the active
+/// client's.
+pub fn var_os(name: impl AsRef<OsStr>) -> Option<OsString> {
+    let name = name.as_ref();
+    match &*ENVIRONMENT.read().unwrap() {
+        Some(env) => env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone()),
+        None => std::env::var_os(name),
+    }
+}
+
 /// Checks if the given environment variable is set.
 pub fn env_var_is_set(env_var_name: &str) -> bool {
     std::env::var_os(env_var_name).is_some()

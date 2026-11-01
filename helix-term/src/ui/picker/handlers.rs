@@ -77,7 +77,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
             let loader = editor.syn_loader.load();
             let text = doc.text().clone();
 
-            tokio::task::spawn_blocking(move || {
+            helix_event::client::spawn_blocking(move || {
                 let syntax = match helix_core::Syntax::new(text.slice(..), language, &loader) {
                     Ok(syntax) => syntax,
                     Err(err) => {
@@ -178,7 +178,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for DynamicQu
             picker.matcher.restart(false);
             let injector = picker.injector();
             let get_options = (callback)(&query, editor, picker.editor_data.clone(), &injector);
-            tokio::spawn(async move {
+            helix_event::client::spawn(async move {
                 if let Err(err) = get_options.await {
                     log::info!("Dynamic request failed: {err}");
                 }

@@ -8,7 +8,7 @@ use helix_core::file_watcher::{
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_loader::workspace_trust::TrustQuery;
 use helix_view::editor::Config;
-use helix_view::events::ConfigDidChange;
+use helix_view::events::{ConfigDidChange, DocumentChangedOnDisk};
 use helix_view::handlers::{AutoReloadEvent, Handlers};
 use helix_view::{Document, DocumentId, Editor};
 use tokio::time::Instant;
@@ -172,18 +172,20 @@ fn handle_document_change(editor: &mut Editor, compositor: &mut Compositor, doc_
     // `changed_mtime` skips the document from here on.
     doc.auto_reload_reported = Some((mtime, doc.is_modified()));
     if doc.is_modified() {
-        if config.auto_reload.prompt_if_modified {
-            let path_str = doc
-                .relative_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "[scratch]".into());
-            prompt_reload_modified(compositor, doc_id, path_str);
-        } else {
-            let msg = format!(
-                "{} changed externally but has unsaved changes, use :reload to refresh",
-                doc.relative_path().unwrap().display()
-            );
-            editor.set_warning(msg);
+        if config.auto_reload.notify_if_modified {
+            if config.auto_reload.prompt_if_modified {
+                let path_str = doc
+                    .relative_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "[scratch]".into());
+                prompt_reload_modified(compositor, doc_id, path_str);
+            } else {
+                let msg = format!(
+                    "{} changed externally but has unsaved changes, use :reload to refresh",
+                    doc.relative_path().unwrap().display()
+                );
+                editor.set_warning(msg);
+            }
         }
     } else {
         let reloaded = editor.reload_document(doc_id);
@@ -194,6 +196,11 @@ fn handle_document_change(editor: &mut Editor, compositor: &mut Compositor, doc_
         }
         editor.set_status(format!("{} reloaded (external changes)", path.display()));
     }
+
+    dispatch(DocumentChangedOnDisk {
+        editor,
+        doc: doc_id,
+    });
 }
 
 /// Reload VCS diffs for all documents

@@ -339,7 +339,8 @@ Changes are found by the [file watcher](#editorfile-watcher-section). Every open
 | Key | Description | Default |
 |--|--|---------|
 | `enable` | Reload files that changed on disk | `true` |
-| `prompt-if-modified` | How to report a change on disk to a buffer with unsaved changes: `true` opens a prompt that reloads the file and discards the unsaved changes on `y`, and `false` shows a warning in the statusline and leaves it to `:reload` | `true` |
+| `notify-if-modified` | Whether to say anything when a file changed on disk and its buffer has unsaved changes. When `false`, the buffer is left as it is with no message | `true` |
+| `prompt-if-modified` | How to report a change on disk to a buffer with unsaved changes: `true` opens a prompt that reloads the file and discards the unsaved changes on `y`, and `false` shows a warning in the statusline and leaves it to `:reload`. Has no effect when `notify-if-modified` is `false` | `true` |
 | `poll.enable` | Check every open file at an interval | `true` |
 | `poll.interval` | Time between checks, in milliseconds | `30000` |
 

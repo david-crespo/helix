@@ -6,7 +6,8 @@ use helix_core::file_watcher::{
     CanonicalPathBuf, Event as FsEvent, EventType, FileSystemDidChange, WatchRootCrawled,
 };
 use helix_term::application::Application;
-use helix_view::{doc, input::parse_macro};
+use helix_view::events::DocumentChangedOnDisk;
+use helix_view::{doc, input::parse_macro, DocumentId};
 use tempfile::NamedTempFile;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -269,6 +270,23 @@ async fn reload_during_insert_is_its_own_undo_step() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What each `DocumentChangedOnDisk` saw: the document, its text and whether
+/// it was modified.
+type ChangedOnDisk = Arc<Mutex<Vec<(DocumentId, String, bool)>>>;
+
+/// Call after building the app, which registers the event.
+fn record_changed_on_disk() -> ChangedOnDisk {
+    let seen = ChangedOnDisk::default();
+    let seen_ = seen.clone();
+    helix_event::register_hook!(move |event: &mut DocumentChangedOnDisk<'_>| {
+        let doc = doc!(event.editor, &event.doc);
+        let entry = (event.doc, doc.text().to_string(), doc.is_modified());
+        seen_.lock().unwrap().push(entry);
+        Ok(())
+    });
+    seen
+}
+
 /// The paths of each `FileSystemDidChange`, which is what language servers are
 /// told changed. Call after building the app, which registers the event.
 fn record_fs_changes() -> Arc<Mutex<Vec<PathBuf>>> {
@@ -283,6 +301,79 @@ fn record_fs_changes() -> Arc<Mutex<Vec<PathBuf>>> {
     seen
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_on_disk_after_reloading_unmodified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    let seen = record_changed_on_disk();
+    let id = doc!(app.editor).id();
+    write_externally(file.path(), "a\nB\nc\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+
+    assert_eq!(*seen.lock().unwrap(), [(id, "a\nB\nc\n".into(), false)]);
+    Ok(())
+}
+
+/// Once per change: the buffer stays modified, so later checks find the same
+/// change again.
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_on_disk_for_modified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app_with(|config| config.editor.auto_reload.prompt_if_modified = false)?;
+    let seen = record_changed_on_disk();
+    let id = doc!(app.editor).id();
+    keys(&mut app, "iX<esc>").await;
+    write_externally(file.path(), "a\nb\nC\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+    send(&mut app, [FOCUS_GAINED]).await;
+
+    assert_eq!(*seen.lock().unwrap(), [(id, "Xa\nb\nc\n".into(), true)]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_on_disk_waits_for_settle() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    let seen = record_changed_on_disk();
+    write_externally(file.path(), "", Duration::ZERO);
+    send(&mut app, [FOCUS_GAINED]).await;
+    assert!(seen.lock().unwrap().is_empty());
+
+    write_externally(file.path(), "a\nB\nc\n", Duration::ZERO);
+    wait_for(&mut app, |_| !seen.lock().unwrap().is_empty()).await;
+    assert_eq!(seen.lock().unwrap()[0].1, "a\nB\nc\n");
+    Ok(())
+}
+
+/// By default a prompt asks about a modified buffer, and takes the next keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn prompts_about_modified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    keys(&mut app, "iX<esc>").await;
+    write_externally(file.path(), "a\nb\nC\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+    keys(&mut app, "iY<esc>").await;
+
+    assert_eq!(doc!(app.editor).text(), "Xa\nb\nc\n");
+    assert!(status(&app).ends_with("external changes ignored"));
+    Ok(())
+}
+
+/// With `notify-if-modified` off, a modified buffer is left to a hook: no
+/// prompt takes the keys and no warning shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn notify_if_modified_off_leaves_modified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app_with(|config| config.editor.auto_reload.notify_if_modified = false)?;
+    let seen = record_changed_on_disk();
+    keys(&mut app, "iX<esc>").await;
+    write_externally(file.path(), "a\nb\nC\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+    assert_eq!(status(&app), "");
+    keys(&mut app, "iY<esc>").await;
+
+    assert_eq!(doc!(app.editor).text(), "XYa\nb\nc\n");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    Ok(())
+}
+
 /// The watcher can miss a change: one made before it first crawled the
 /// directory, or while it couldn't watch. So the focus and poll checks cover
 /// watched files too.
@@ -294,6 +385,54 @@ async fn focus_reloads_watched_file() -> anyhow::Result<()> {
     send(&mut app, [FOCUS_GAINED]).await;
 
     assert_eq!(doc!(app.editor).text(), "a\nB\nc\n");
+    Ok(())
+}
+
+/// A watcher event for Helix's own save finds the mtime the save recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_save_is_not_a_change_on_disk() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    let seen = record_changed_on_disk();
+    keys(&mut app, "iX<esc>:w<ret>").await;
+    wait_for(&mut app, |app| !doc!(app.editor).is_modified()).await;
+    let saved = status(&app).to_owned();
+    // Past the settle window, so the event isn't just put off.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    watcher_event(&mut app, file.path(), EventType::Modified).await;
+
+    assert_eq!(status(&app), saved);
+    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(file.path())?, "Xa\nb\nc\n");
+    Ok(())
+}
+
+/// The hook is for a document that has been reloaded, or couldn't be for its
+/// unsaved changes. A reload that failed is neither. The failure is reported
+/// once, not by every check that finds the file still changed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn no_changed_on_disk_after_failed_reload() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (file, mut app) = app()?;
+    let seen = record_changed_on_disk();
+    let changes = record_fs_changes();
+    write_externally(file.path(), "a\nB\nc\n", Duration::from_secs(5));
+    std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o000))?;
+    send(&mut app, [FOCUS_GAINED]).await;
+
+    assert!(
+        status(&app).contains("auto-reload failed"),
+        "{}",
+        status(&app)
+    );
+    assert_eq!(doc!(app.editor).text(), "a\nb\nc\n");
+    assert!(seen.lock().unwrap().is_empty());
+
+    app.editor.clear_status();
+    send(&mut app, [FOCUS_GAINED]).await;
+    assert_eq!(status(&app), "");
+    assert_eq!(changes.lock().unwrap().len(), 1);
     Ok(())
 }
 

@@ -25,6 +25,9 @@ events! {
     // called **after** a document loses focus (but not when its closed)
     DocumentFocusLost<'a> { editor: &'a mut Editor, doc: DocumentId }
     DocumentSaved<'a> { editor: &'a mut Editor, doc: DocumentId }
+    // called after auto-reload has handled a change to the document's file on disk: an
+    // unmodified document has been reloaded, a modified one is left as it was
+    DocumentChangedOnDisk<'a> { editor: &'a mut Editor, doc: DocumentId }
 
     LanguageServerInitialized<'a> {
         editor: &'a mut Editor,

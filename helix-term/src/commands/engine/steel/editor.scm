@@ -26,6 +26,7 @@
 ;; * 'document-saved
 ;; * 'document-changed
 ;; * 'document-closed
+;; * 'document-changed-on-disk
 ;;
 ;; Each of these expects a function with a slightly different signature to accept
 ;; the event payload.
@@ -100,6 +101,14 @@
 ;; ### Example:
 ;; ```scheme
 ;; (register-hook 'document-closed (lambda (closed-event) (log::info! (doc-closed-id closed-event))))
+;; ```
+;; ## document-changed-on-disk
+;;
+;; Expects a function with one argument to accept the doc id of a document whose file changed on
+;; disk. Called after auto-reload has handled the change: an unmodified document has already been
+;; reloaded, and a modified one is left as it was, so check `editor-document-dirty?`. Set
+;; `editor.auto-reload.notify-if-modified = false` to replace the prompt or warning for modified
+;; documents. Called once per change, once the file has gone 150ms without a write.
 (define (register-hook event-kind callback-fn)
   (helix.register-hook event-kind callback-fn))
 

@@ -560,6 +560,9 @@ pub enum KittyKeyboardProtocolConfig {
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AutoReloadConfig {
     pub enable: bool,
+    /// Whether to prompt or warn about a change on disk to a buffer with unsaved
+    /// changes. Turn off to leave it to a `document-changed-on-disk` hook.
+    pub notify_if_modified: bool,
     pub prompt_if_modified: bool,
     /// Poll for changes to files outside the watched workspace
     pub poll: AutoReloadPoll,
@@ -569,6 +572,7 @@ impl Default for AutoReloadConfig {
     fn default() -> Self {
         AutoReloadConfig {
             enable: true,
+            notify_if_modified: true,
             prompt_if_modified: true,
             poll: AutoReloadPoll::default(),
         }

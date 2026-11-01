@@ -2,9 +2,9 @@ use helix_core::file_watcher::FileSystemDidChange;
 use helix_event::{events, register_event};
 use helix_view::document::Mode;
 use helix_view::events::{
-    ConfigDidChange, DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen,
-    DocumentFocusLost, DocumentSaved, LanguageServerExited, LanguageServerInitialized,
-    SelectionDidChange,
+    ConfigDidChange, DiagnosticsDidChange, DocumentChangedOnDisk, DocumentDidChange,
+    DocumentDidClose, DocumentDidOpen, DocumentFocusLost, DocumentSaved, LanguageServerExited,
+    LanguageServerInitialized, SelectionDidChange,
 };
 
 use crate::commands;
@@ -29,6 +29,7 @@ pub fn register() {
     register_event::<DocumentDidClose>();
     register_event::<DocumentFocusLost>();
     register_event::<DocumentSaved>();
+    register_event::<DocumentChangedOnDisk>();
     register_event::<SelectionDidChange>();
     register_event::<DiagnosticsDidChange>();
     register_event::<LanguageServerInitialized>();

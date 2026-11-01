@@ -1,11 +1,13 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use helix_core::file_watcher::{
     CanonicalPathBuf, Event as FsEvent, EventType, FileSystemDidChange,
 };
 use helix_term::application::Application;
-use helix_view::{doc, input::parse_macro};
+use helix_view::events::DocumentChangedOnDisk;
+use helix_view::{doc, input::parse_macro, DocumentId};
 use tempfile::NamedTempFile;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -278,5 +280,95 @@ async fn reload_during_insert_is_its_own_undo_step() -> anyhow::Result<()> {
     assert_eq!(doc!(app.editor).text(), "Xa\nb\nc\n");
     keys(&mut app, "u").await;
     assert_eq!(doc!(app.editor).text(), "a\nb\nc\n");
+    Ok(())
+}
+
+/// What each `DocumentChangedOnDisk` saw: the document, its text and whether
+/// it was modified.
+type ChangedOnDisk = Arc<Mutex<Vec<(DocumentId, String, bool)>>>;
+
+/// Call after building the app, which registers the event.
+fn record_changed_on_disk() -> ChangedOnDisk {
+    let seen = ChangedOnDisk::default();
+    let seen_ = seen.clone();
+    helix_event::register_hook!(move |event: &mut DocumentChangedOnDisk<'_>| {
+        let doc = doc!(event.editor, &event.doc);
+        let entry = (event.doc, doc.text().to_string(), doc.is_modified());
+        seen_.lock().unwrap().push(entry);
+        Ok(())
+    });
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_on_disk_after_reloading_unmodified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    let seen = record_changed_on_disk();
+    let id = doc!(app.editor).id();
+    write_externally(file.path(), "a\nB\nc\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+
+    assert_eq!(*seen.lock().unwrap(), [(id, "a\nB\nc\n".into(), false)]);
+    Ok(())
+}
+
+/// Once per change: the buffer stays modified, so later checks find the same
+/// change again.
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_on_disk_for_modified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app_with(|config| config.editor.auto_reload.prompt_if_modified = false)?;
+    let seen = record_changed_on_disk();
+    let id = doc!(app.editor).id();
+    keys(&mut app, "iX<esc>").await;
+    write_externally(file.path(), "a\nb\nC\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+    send(&mut app, [FOCUS_GAINED]).await;
+
+    assert_eq!(*seen.lock().unwrap(), [(id, "Xa\nb\nc\n".into(), true)]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_on_disk_waits_for_settle() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    let seen = record_changed_on_disk();
+    write_externally(file.path(), "", Duration::ZERO);
+    send(&mut app, [FOCUS_GAINED]).await;
+    assert!(seen.lock().unwrap().is_empty());
+
+    write_externally(file.path(), "a\nB\nc\n", Duration::ZERO);
+    wait_for(&mut app, |_| !seen.lock().unwrap().is_empty()).await;
+    assert_eq!(seen.lock().unwrap()[0].1, "a\nB\nc\n");
+    Ok(())
+}
+
+/// By default a prompt asks about a modified buffer, and takes the next keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn prompts_about_modified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app()?;
+    keys(&mut app, "iX<esc>").await;
+    write_externally(file.path(), "a\nb\nC\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+    keys(&mut app, "iY<esc>").await;
+
+    assert_eq!(doc!(app.editor).text(), "Xa\nb\nc\n");
+    assert!(status(&app).ends_with("external changes ignored"));
+    Ok(())
+}
+
+/// With `notify-if-modified` off, a modified buffer is left to a hook: no
+/// prompt takes the keys and no warning shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn notify_if_modified_off_leaves_modified_buffer() -> anyhow::Result<()> {
+    let (file, mut app) = app_with(|config| config.editor.auto_reload.notify_if_modified = false)?;
+    let seen = record_changed_on_disk();
+    keys(&mut app, "iX<esc>").await;
+    write_externally(file.path(), "a\nb\nC\n", Duration::from_secs(5));
+    send(&mut app, [FOCUS_GAINED]).await;
+    assert_eq!(status(&app), "");
+    keys(&mut app, "iY<esc>").await;
+
+    assert_eq!(doc!(app.editor).text(), "XYa\nb\nc\n");
+    assert_eq!(seen.lock().unwrap().len(), 1);
     Ok(())
 }

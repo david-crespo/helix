@@ -32,8 +32,8 @@ use helix_view::{
         WhitespaceConfig, WhitespaceRender, WhitespaceRenderValue,
     },
     events::{
-        DocumentDidChange, DocumentDidClose, DocumentDidOpen, DocumentFocusLost, DocumentSaved,
-        SelectionDidChange,
+        DocumentChangedOnDisk, DocumentDidChange, DocumentDidClose, DocumentDidOpen,
+        DocumentFocusLost, DocumentSaved, SelectionDidChange,
     },
     extension::{document_id_to_usize, steel_implementations::CustomStatusElement},
     graphics::CursorKind,
@@ -3465,6 +3465,7 @@ fn register_hook(event_kind: String, callback_fn: SteelVal) -> steel::UnRecovera
         "document-saved" => register_document_saved(generation, rooted),
         "document-changed" => register_document_changed(generation, rooted),
         "document-closed" => register_document_closed(generation, rooted),
+        "document-changed-on-disk" => register_document_changed_on_disk(generation, rooted),
         _ => steelerr!(Generic => "Unable to register hook: Unknown event type: {}", event_kind)
             .into(),
     }
@@ -3624,6 +3625,22 @@ fn register_document_focus_lost(
     // is probably the most helpful so that way we can look the document up
     // and act accordingly?
     register_hook!(move |event: &mut DocumentFocusLost<'_>| {
+        let cloned_func = rooted.value().clone();
+        let doc_id = event.doc;
+        let callback =
+            construct_callback(generation, cloned_func, [doc_id.into_steelval().unwrap()]);
+        job::dispatch_blocking_jobs(callback);
+
+        Ok(())
+    });
+    Ok(SteelVal::Void).into()
+}
+
+fn register_document_changed_on_disk(
+    generation: usize,
+    rooted: RootedSteelVal,
+) -> steel::UnRecoverableResult {
+    register_hook!(move |event: &mut DocumentChangedOnDisk<'_>| {
         let cloned_func = rooted.value().clone();
         let doc_id = event.doc;
         let callback =

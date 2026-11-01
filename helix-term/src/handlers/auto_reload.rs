@@ -9,7 +9,7 @@ use helix_core::file_watcher::{events_from_paths, Event, EventType, FileSystemDi
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_loader::workspace_trust::TrustQuery;
 use helix_view::editor::Config;
-use helix_view::events::ConfigDidChange;
+use helix_view::events::{ConfigDidChange, DocumentChangedOnDisk};
 use helix_view::handlers::{AutoReloadEvent, Handlers};
 use helix_view::{DocumentId, Editor};
 use tokio::time::Instant;
@@ -189,6 +189,7 @@ fn handle_document_change(
     prompt_if_modified: bool,
 ) {
     let scrolloff = editor.config().scrolloff;
+    let notify_if_modified = editor.config().auto_reload.notify_if_modified;
     let target_view_id = editor.get_synced_view_id(doc_id);
     let trust_full = doc_trust_full(editor, doc_id);
 
@@ -237,18 +238,20 @@ fn handle_document_change(
             return;
         }
         doc.auto_reload_seen_mtime = Some(mtime);
-        if prompt_if_modified {
-            let path_str = doc
-                .relative_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "[scratch]".into());
-            prompt_reload_modified(compositor, doc_id, path_str);
-        } else {
-            let msg = format!(
-                "{} changed externally but has unsaved changes, use :reload to refresh",
-                doc.relative_path().unwrap().display()
-            );
-            editor.set_warning(msg);
+        if notify_if_modified {
+            if prompt_if_modified {
+                let path_str = doc
+                    .relative_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "[scratch]".into());
+                prompt_reload_modified(compositor, doc_id, path_str);
+            } else {
+                let msg = format!(
+                    "{} changed externally but has unsaved changes, use :reload to refresh",
+                    doc.relative_path().unwrap().display()
+                );
+                editor.set_warning(msg);
+            }
         }
     } else {
         let view = view_mut!(editor, target_view_id);
@@ -271,6 +274,11 @@ fn handle_document_change(
             }
         }
     }
+
+    dispatch(DocumentChangedOnDisk {
+        editor,
+        doc: doc_id,
+    });
 }
 
 /// Reload VCS diffs for all documents

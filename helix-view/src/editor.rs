@@ -561,7 +561,7 @@ pub enum KittyKeyboardProtocolConfig {
 pub struct AutoReloadConfig {
     pub enable: bool,
     pub prompt_if_modified: bool,
-    /// Poll for changes to files outside the watched workspace
+    /// Check every open file at an interval
     pub poll: AutoReloadPoll,
 }
 
@@ -575,14 +575,14 @@ impl Default for AutoReloadConfig {
     }
 }
 
-/// Configuration for polling unwatched files for external changes
+/// Configuration for checking open files for external changes at an interval.
+/// The file watcher can miss a change, so watched files are checked too.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AutoReloadPoll {
-    /// Enable polling for files outside the watched workspace
     pub enable: bool,
     /// Polling interval in milliseconds (default: 30000). This is only a backstop:
-    /// unwatched files are normally re-checked when the terminal regains focus.
+    /// files are also checked when the terminal regains focus.
     pub interval: u64,
 }
 
@@ -1945,7 +1945,18 @@ impl Editor {
         doc.language_servers.clear();
         doc.set_path(Some(path));
         doc.detect_editor_config();
-        self.refresh_doc_language(doc_id)
+        self.refresh_doc_language(doc_id);
+        self.watch_open_files();
+    }
+
+    /// Tells the file watcher which files are open, to watch the ones outside
+    /// the workspace or in ignored directories too. It watches each one's
+    /// directory and drops the events for anything but the open files. On Linux
+    /// that is a watch of the one directory. On macOS an FSEvents stream covers
+    /// the directory's whole subtree, so a busy subtree costs events to drop.
+    fn watch_open_files(&mut self) {
+        let paths = self.documents.values().filter_map(|doc| doc.path());
+        self.file_watcher.set_open_files(paths);
     }
 
     pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
@@ -2282,6 +2293,7 @@ impl Editor {
 
             let id = self.new_document(doc);
             self.launch_language_servers(id);
+            self.watch_open_files();
 
             helix_event::dispatch(DocumentDidOpen {
                 editor: self,
@@ -2354,6 +2366,7 @@ impl Editor {
         }
 
         let doc = self.documents.remove(&doc_id).unwrap();
+        self.watch_open_files();
 
         // If the document we removed was visible in all views, we will have no more views. We don't
         // want to close the editor just for a simple buffer close, so we need to create a new view
@@ -2750,6 +2763,22 @@ impl Editor {
             doc.ensure_view_init(current_view.id);
             current_view.id
         }
+    }
+
+    /// Reloads the document from its file through a view that shows it, and
+    /// keeps that view's cursor on screen.
+    pub fn reload_document(&mut self, id: DocumentId) -> anyhow::Result<()> {
+        let scrolloff = self.config().scrolloff;
+        let view_id = self.get_synced_view_id(id);
+        let doc = doc_mut!(self, &id);
+        let trust_full = self
+            .workspace_trust
+            .query(doc.workspace_root(), TrustQuery::Git)
+            .is_trusted();
+        let view = view_mut!(self, view_id);
+        doc.reload(view, &self.diff_providers, trust_full)?;
+        view.ensure_cursor_in_view(doc, scrolloff);
+        Ok(())
     }
 
     pub fn set_cwd(&mut self, path: &Path) -> std::io::Result<()> {

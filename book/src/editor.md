@@ -7,8 +7,10 @@
 - [`[editor.cursor-shape]` Section](#editorcursor-shape-section)
 - [`[editor.file-picker]` Section](#editorfile-picker-section)
 - [`[editor.file-explorer]` Section](#editorfile-explorer-section)
+- [`[editor.file-watcher]` Section](#editorfile-watcher-section)
 - [`[editor.buffer-picker]` Section](#editorbuffer-picker-section)
 - [`[editor.auto-pairs]` Section](#editorauto-pairs-section)
+- [`[editor.auto-reload]` Section](#editorauto-reload-section)
 - [`[editor.auto-save]` Section](#editorauto-save-section)
 - [`[editor.search]` Section](#editorsearch-section)
 - [`[editor.whitespace]` Section](#editorwhitespace-section)
@@ -252,6 +254,23 @@ Note that the ignore files consulted by the file explorer when `ignore` is set t
 |`git-exclude` | Enables reading `.git/info/exclude` files | `false`
 |`flatten-dirs` | Enables flattening single child directories | `true`
 
+### `[editor.file-watcher]` Section
+
+Controls the file watcher, which reports changes made to files outside of Helix. Open buffers are [reloaded](#editorauto-reload-section), language servers that ask for file events get them, and the diff gutter follows the checked-out commit.
+
+The watcher watches the workspace: the directory Helix was started in or the nearest directory above it with a `.git`, `.jj`, `.svn` or `.helix` directory. It also watches directories outside the workspace that language servers ask for. Ignored files and directories are not watched. Patterns in `.helix/filesentryignore` in the workspace and `filesentryignore` in the configuration directory, in `.gitignore` syntax, apply to the watcher alone, and a negated pattern there (`!target`) watches something another ignore file excludes.
+
+| Key | Description | Default |
+|--|--|---------|
+| `enable` | Enables the file watcher | `true` |
+| `watch-vcs` | Watch `.git/HEAD`, to update the diff gutter and the branch name when the checked-out commit changes | `true` |
+| `require-workspace` | Watch the workspace only if a workspace directory was found, so that starting Helix in a directory like the home directory doesn't watch all of it | `true` |
+| `hidden` | Don't watch hidden files and directories, other than `.helix`, `.github`, `.cargo` and `.envrc` | `false` |
+| `ignore` | Don't watch files matched by `.ignore` files | `true` |
+| `git-ignore` | Don't watch files matched by `.gitignore` files | `true` |
+| `git-global` | Don't watch files matched by the global gitignore file, the one git's `core.excludesFile` option sets | `true` |
+| `watch-open-files` | Also watch the files open in Helix that would otherwise not be watched: those outside the workspace or in an ignored or hidden directory, and all of them when `require-workspace` leaves the workspace unwatched | `true` |
+
 ### `[editor.buffer-picker]` Section
 
 Set options for buffer picker.
@@ -310,6 +329,19 @@ name = "rust"
 '`' = '`'
 '<' = '>'
 ```
+
+### `[editor.auto-reload]` Section
+
+Controls reloading of files that changed on disk. A buffer without unsaved changes is reloaded, and the reload is one undo step. A buffer with unsaved changes is never reloaded without asking.
+
+Changes are found by the [file watcher](#editorfile-watcher-section). Every open file is also checked when the terminal regains focus (this requires [focus event support](https://github.com/helix-editor/helix/wiki/Terminal-Support) from your terminal) and at the poll interval, which covers files the watcher doesn't watch and changes it missed.
+
+| Key | Description | Default |
+|--|--|---------|
+| `enable` | Reload files that changed on disk | `true` |
+| `prompt-if-modified` | How to report a change on disk to a buffer with unsaved changes: `true` opens a prompt that reloads the file and discards the unsaved changes on `y`, and `false` shows a warning in the statusline and leaves it to `:reload` | `true` |
+| `poll.enable` | Check every open file at an interval | `true` |
+| `poll.interval` | Time between checks, in milliseconds | `30000` |
 
 ### `[editor.auto-save]` Section
 

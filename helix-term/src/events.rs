@@ -1,4 +1,4 @@
-use helix_core::file_watcher::FileSystemDidChange;
+use helix_core::file_watcher::{FileSystemDidChange, WatchRootCrawled};
 use helix_event::{events, register_event};
 use helix_view::document::Mode;
 use helix_view::events::{
@@ -35,4 +35,5 @@ pub fn register() {
     register_event::<LanguageServerExited>();
     register_event::<ConfigDidChange>();
     register_event::<FileSystemDidChange>();
+    register_event::<WatchRootCrawled>();
 }

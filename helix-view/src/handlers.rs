@@ -20,7 +20,8 @@ pub enum AutoSaveEvent {
 
 #[derive(Debug)]
 pub enum AutoReloadEvent {
-    /// Schedule a poll check after the given interval (ms)
+    /// Check the open documents against their files after the given interval
+    /// (ms), or sooner if a check is already due sooner
     PollAfter { interval: u64 },
 }
 

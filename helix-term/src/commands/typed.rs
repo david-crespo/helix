@@ -1592,14 +1592,9 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         return Ok(());
     }
 
-    let scrolloff = cx.editor.config().scrolloff;
-    let trust_full = doc_trust_full(cx.editor);
-    let (view, doc) = current!(cx.editor);
-    doc.reload(view, &cx.editor.diff_providers, trust_full)
-        .map(|_| {
-            view.ensure_cursor_in_view(doc, scrolloff);
-        })?;
-    if let Some(path) = doc.path().map(ToOwned::to_owned) {
+    let doc_id = doc!(cx.editor).id();
+    cx.editor.reload_document(doc_id)?;
+    if let Some(path) = doc!(cx.editor).path().map(ToOwned::to_owned) {
         if !cx.editor.file_watcher.is_watching(&path) {
             cx.editor
                 .language_servers
@@ -4618,19 +4613,6 @@ fn complete_expansion_kind(content: &str, offset: usize) -> Vec<ui::prompt::Comp
 fn current_workspace(cx: &compositor::Context) -> std::path::PathBuf {
     let (_, doc) = current_ref!(cx.editor);
     doc.workspace_root().to_path_buf()
-}
-
-/// Whether the currently focused document's workspace is trusted for git operations (gix
-/// `Trust::Full`).
-fn doc_trust_full(editor: &helix_view::Editor) -> bool {
-    let (_, doc) = current_ref!(editor);
-    editor
-        .workspace_trust
-        .query(
-            doc.workspace_root(),
-            helix_loader::workspace_trust::TrustQuery::Git,
-        )
-        .is_trusted()
 }
 
 fn trust_workspace(

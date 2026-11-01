@@ -1,86 +1,58 @@
 use std::borrow::Cow;
-use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use helix_core::file_watcher::{events_from_paths, EventType, FileSystemDidChange};
+use helix_core::file_watcher::{
+    events_from_paths, Event, EventType, FileSystemDidChange, WatchRootCrawled,
+};
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_loader::workspace_trust::TrustQuery;
 use helix_view::editor::Config;
 use helix_view::events::ConfigDidChange;
 use helix_view::handlers::{AutoReloadEvent, Handlers};
-use helix_view::{DocumentId, Editor};
+use helix_view::{Document, DocumentId, Editor};
 use tokio::time::Instant;
 
 use crate::compositor::Compositor;
 use crate::ui::{Prompt, PromptEvent};
 use crate::{job, ui};
 
-/// Whether the document's workspace is trusted for full git access.
-fn doc_trust_full(editor: &Editor, doc_id: DocumentId) -> bool {
-    let doc = doc!(editor, &doc_id);
-    editor
-        .workspace_trust
-        .query(doc.workspace_root(), TrustQuery::Git)
-        .is_trusted()
-}
-
-/// Handler for FileSystemDidChange events (from filesentry or polling)
-struct ReloadHandler {
-    enable: AtomicBool,
-    prompt_if_modified: AtomicBool,
-}
-
-impl ReloadHandler {
-    pub fn refresh_config(&self, config: &Config) {
-        self.enable
-            .store(config.auto_reload.enable, atomic::Ordering::Relaxed);
-        self.prompt_if_modified.store(
-            config.auto_reload.prompt_if_modified,
-            atomic::Ordering::Relaxed,
-        );
+/// Reloads the open documents that changed on disk, for a batch of events from
+/// the file watcher or from a poll or focus check.
+fn on_file_did_change(event: &mut FileSystemDidChange) {
+    // A file deleted and recreated in separate settle windows (some VCS
+    // operations) is reported as created, not modified.
+    let fs_events: Vec<Event> = event
+        .fs_events
+        .iter()
+        .filter(|event| matches!(event.ty, EventType::Modified | EventType::Create))
+        .cloned()
+        .collect();
+    if fs_events.is_empty() {
+        return;
     }
-
-    fn on_file_did_change(&self, event: &mut FileSystemDidChange) {
-        if !self.enable.load(atomic::Ordering::Relaxed) {
+    job::dispatch_blocking(move |editor, compositor| {
+        if !editor.config().auto_reload.enable {
             return;
         }
-        let fs_events = event.fs_events.clone();
-        if !fs_events
+        // Every document is checked, not only the ones the events are for: the
+        // check is one stat each, and event paths have symlinks resolved where
+        // document paths don't.
+        let doc_ids: Vec<_> = editor.documents().map(|doc| doc.id()).collect();
+        for doc_id in doc_ids {
+            handle_document_change(editor, compositor, doc_id);
+        }
+
+        if fs_events
             .iter()
-            .any(|event| event.ty == EventType::Modified)
+            .any(|fs_event| editor.diff_providers.needs_reload(fs_event))
         {
-            return;
+            reload_vcs_diffs(editor);
         }
-        let prompt_if_modified = self.prompt_if_modified.load(atomic::Ordering::Relaxed);
-        job::dispatch_blocking(move |editor, compositor| {
-            let mut vcs_reload = false;
-
-            for fs_event in &*fs_events {
-                if fs_event.ty != EventType::Modified {
-                    continue;
-                }
-                vcs_reload |= editor.diff_providers.needs_reload(fs_event);
-
-                let Some(doc_id) = editor.document_id_by_path(fs_event.path.as_std_path()) else {
-                    continue;
-                };
-
-                handle_document_change(editor, compositor, doc_id, prompt_if_modified);
-            }
-
-            if vcs_reload {
-                reload_vcs_diffs(editor);
-            }
-        });
-    }
+    });
 }
 
-/// Handler for polling-based change detection for unwatched files.
-/// Polls documents not covered by the file watcher (e.g., outside workspace or in ignored dirs).
-/// Co-Authored-By: Anthony Rubick <68485672+AnthonyMichaelTDM@users.noreply.github.com>
+/// Runs the periodic check, and the check of a file left to settle.
 #[derive(Debug)]
 pub(super) struct PollHandler;
 
@@ -96,76 +68,57 @@ impl helix_event::AsyncHook for PollHandler {
     fn handle_event(
         &mut self,
         event: Self::Event,
-        _existing_debounce: Option<Instant>,
+        existing_debounce: Option<Instant>,
     ) -> Option<Instant> {
         match event {
+            // The sooner of this and a poll already scheduled, so a config change
+            // never puts one off.
             AutoReloadEvent::PollAfter { interval } => {
-                Some(Instant::now() + Duration::from_millis(interval))
+                let next = Instant::now() + Duration::from_millis(interval);
+                Some(existing_debounce.map_or(next, |existing| existing.min(next)))
             }
         }
     }
 
     fn finish_debounce(&mut self) {
         job::dispatch_blocking(move |editor, _compositor| {
-            let config = editor.config();
-            if !config.auto_reload.enable || !config.auto_reload.poll.enable {
-                return;
-            }
-
-            let poll_interval = config.auto_reload.poll.interval;
-
-            // Check unwatched documents for external modifications
-            let modified_paths = changed_unwatched_paths(editor);
-
-            // Poll extra watched paths (e.g., VCS HEAD files outside workspace)
-            let extra_path_changes = editor.file_watcher.poll_extra_paths();
-
-            // Dispatch changes through the FileSystemDidChange hook
-            let all_changed: Vec<PathBuf> = modified_paths
-                .into_iter()
-                .chain(extra_path_changes)
-                .collect();
-            if !all_changed.is_empty() {
-                let events = events_from_paths(all_changed);
-                dispatch(FileSystemDidChange { fs_events: events });
-            }
-
-            // Schedule next poll
-            send_blocking(
-                &editor.handlers.auto_reload,
-                AutoReloadEvent::PollAfter {
-                    interval: poll_interval,
-                },
-            );
+            check_documents(editor);
+            schedule_poll(&editor.handlers, &editor.config());
         });
     }
 }
 
-/// Open documents not covered by the file watcher (outside the workspace, or
-/// ignored) whose on-disk mtime no longer matches their last save.
-fn changed_unwatched_paths(editor: &Editor) -> Vec<PathBuf> {
-    editor
-        .documents()
-        .filter_map(|doc| {
-            let path = doc.path()?;
-            if editor.file_watcher.is_watching(path) {
-                return None;
-            }
-            let mtime = path.metadata().ok()?.modified().ok()?;
-            (mtime != doc.last_saved_time).then(|| path.to_path_buf())
-        })
-        .collect()
+/// The mtime of the document's file if it has a change the document hasn't
+/// taken: it differs from the last save or reload, and isn't a conflict with
+/// unsaved changes or a failed reload that was already reported. A conflicted
+/// buffer undone back to unmodified has a change again.
+fn changed_mtime(doc: &Document) -> Option<SystemTime> {
+    let mtime = doc.path()?.metadata().ok()?.modified().ok()?;
+    let reported = doc.auto_reload_reported == Some((mtime, doc.is_modified()));
+    (mtime != doc.last_saved_time && !reported).then_some(mtime)
 }
 
-/// Re-check unwatched open files when the terminal regains focus -- they are only
-/// polled otherwise, and regaining focus is when a user is most likely to have
-/// just edited them elsewhere. Routes through the same `FileSystemDidChange` path
-/// as the watcher and poll (so prompt de-duplication still applies).
-pub(crate) fn on_focus_gained(editor: &Editor) {
+/// Checks every open document against its file, on a poll and when the terminal
+/// regains focus. The watcher can miss a change (one made before it first
+/// crawled the directory, or while a watch failed), so this covers watched
+/// files too. Goes through `FileSystemDidChange` as watcher events do, so
+/// language servers are told as well.
+pub(crate) fn check_documents(editor: &mut Editor) {
     if !editor.config().auto_reload.enable {
         return;
     }
-    let changed = changed_unwatched_paths(editor);
+    // A file still settling is left out, and so announced once, by the poll
+    // after it has settled.
+    let (settling, settled): (Vec<_>, Vec<_>) = editor
+        .documents()
+        .filter_map(|doc| Some((changed_mtime(doc)?, doc.path()?.to_owned())))
+        .partition(|(mtime, _)| is_settling(*mtime));
+    if !settling.is_empty() {
+        poll_once_settled(editor);
+    }
+    let mut changed: Vec<PathBuf> = settled.into_iter().map(|(_, path)| path).collect();
+    // VCS HEAD files outside the workspace
+    changed.extend(editor.file_watcher.poll_extra_paths());
     if !changed.is_empty() {
         dispatch(FileSystemDidChange {
             fs_events: events_from_paths(changed),
@@ -173,41 +126,53 @@ pub(crate) fn on_focus_gained(editor: &Editor) {
     }
 }
 
-/// Handler for document changes detected by filesentry or polling
-fn handle_document_change(
-    editor: &mut Editor,
-    compositor: &mut Compositor,
-    doc_id: DocumentId,
-    prompt_if_modified: bool,
-) {
-    let scrolloff = editor.config().scrolloff;
-    let target_view_id = editor.get_synced_view_id(doc_id);
-    let trust_full = doc_trust_full(editor, doc_id);
+const SETTLE: Duration = Duration::from_millis(150);
 
-    let doc = doc_mut!(editor, &doc_id);
-    let Some(path) = doc.path().map(ToOwned::to_owned) else {
+/// Whether the file was written within `SETTLE`. A writer that isn't atomic
+/// leaves the file briefly empty or partial: a jj checkout truncates the file,
+/// then writes the contents. So a file just written is left for a poll once it
+/// has settled.
+fn is_settling(mtime: SystemTime) -> bool {
+    SystemTime::now()
+        .duration_since(mtime)
+        .is_ok_and(|age| age < SETTLE)
+}
+
+fn poll_once_settled(editor: &Editor) {
+    let interval = SETTLE.as_millis() as u64;
+    send_blocking(
+        &editor.handlers.auto_reload,
+        AutoReloadEvent::PollAfter { interval },
+    );
+}
+
+/// Reloads the document if its file changed, or reports the change if the
+/// document has unsaved changes.
+fn handle_document_change(editor: &mut Editor, compositor: &mut Compositor, doc_id: DocumentId) {
+    let doc = doc!(editor, &doc_id);
+    let Some(mtime) = changed_mtime(doc) else {
         return;
     };
 
-    let mtime = match path.metadata() {
-        Ok(meta) => meta.modified().unwrap_or(SystemTime::now()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
-        Err(_) => SystemTime::now(),
-    };
-
-    if mtime == doc.last_saved_time {
+    // The poll and focus checks leave out a file that is settling. Watcher
+    // events get here with one: every document is checked for any event, and
+    // the watcher's debounce is its own.
+    if is_settling(mtime) {
+        log::info!(
+            "auto-reload: {} was just written, waiting for it to settle",
+            doc.display_name()
+        );
+        poll_once_settled(editor);
         return;
     }
 
+    let config = editor.config();
+    let doc = doc_mut!(editor, &doc_id);
+    // If this ends in a conflict or a failed reload, that is reported once:
+    // `changed_mtime` skips the document from here on.
+    doc.auto_reload_reported = Some((mtime, doc.is_modified()));
     if doc.is_modified() {
-        // Surface a conflict (prompt / warning) once per distinct on-disk mtime;
-        // the buffer is modified so we can't reload, and the poll / focus checks
-        // would otherwise re-fire it on every tick.
-        if doc.auto_reload_seen_mtime == Some(mtime) {
-            return;
-        }
-        doc.auto_reload_seen_mtime = Some(mtime);
-        if prompt_if_modified {
+        if config.auto_reload.prompt_if_modified {
             let path_str = doc
                 .relative_path()
                 .map(|p| p.display().to_string())
@@ -221,25 +186,13 @@ fn handle_document_change(
             editor.set_warning(msg);
         }
     } else {
-        let view = view_mut!(editor, target_view_id);
-        match doc.reload(view, &editor.diff_providers, trust_full) {
-            Ok(_) => {
-                view.ensure_cursor_in_view(doc, scrolloff);
-                let msg = format!(
-                    "{} reloaded (external changes)",
-                    doc.relative_path().unwrap().display()
-                );
-                editor.set_status(msg);
-            }
-            Err(err) => {
-                let doc = doc!(editor, &doc_id);
-                let msg = format!(
-                    "{} auto-reload failed: {err}",
-                    doc.relative_path().unwrap().display()
-                );
-                editor.set_error(msg);
-            }
+        let reloaded = editor.reload_document(doc_id);
+        let path = doc!(editor, &doc_id).relative_path().unwrap();
+        if let Err(err) = reloaded {
+            editor.set_error(format!("{} auto-reload failed: {err}", path.display()));
+            return;
         }
+        editor.set_status(format!("{} reloaded (external changes)", path.display()));
     }
 }
 
@@ -260,39 +213,36 @@ fn reload_vcs_diffs(editor: &mut Editor) {
     }
 }
 
-/// Shows a prompt asking the user whether to reload a modified document.
-/// Co-Authored-By: Anthony Rubick <68485672+AnthonyMichaelTDM@users.noreply.github.com>
+/// Asks whether to reload a document with unsaved changes. Only `y` reloads:
+/// the prompt can open while the user is typing, and their next Enter shouldn't
+/// discard the changes.
 fn prompt_reload_modified(compositor: &mut Compositor, doc_id: DocumentId, path_str: String) {
     let prompt = Prompt::new(
         Cow::Owned(format!(
-            "{path_str} changed externally (unsaved changes exist). Press Enter to reload, Esc to ignore: "
+            "{path_str} changed on disk and has unsaved changes. Reload and discard them? (y/n) "
         )),
         None,
         ui::completers::none,
-        move |cx, _input, event| {
-            match event {
-                PromptEvent::Validate => {
-                    let scrolloff = cx.editor.config().scrolloff;
-                    let target_view_id = cx.editor.get_synced_view_id(doc_id);
-                    let trust_full = doc_trust_full(cx.editor, doc_id);
-                    let doc = doc_mut!(cx.editor, &doc_id);
-                    let view = view_mut!(cx.editor, target_view_id);
-                    match doc.reload(view, &cx.editor.diff_providers, trust_full) {
-                        Ok(_) => {
-                            view.ensure_cursor_in_view(doc, scrolloff);
-                            cx.editor.set_status(format!("{path_str} reloaded"));
-                        }
-                        Err(err) => {
-                            cx.editor
-                                .set_error(format!("{path_str} reload failed: {err}"));
-                        }
-                    }
-                }
-                PromptEvent::Abort => {
-                    cx.editor
-                        .set_status(format!("{path_str} external changes ignored"));
-                }
-                PromptEvent::Update => {}
+        move |cx, input, event| {
+            let reload = match event {
+                PromptEvent::Update => return,
+                PromptEvent::Validate => input.trim().eq_ignore_ascii_case("y"),
+                PromptEvent::Abort => false,
+            };
+            // The document may have been closed while the prompt was open.
+            if cx.editor.document(doc_id).is_none() {
+                return;
+            }
+            if !reload {
+                cx.editor
+                    .set_status(format!("{path_str} external changes ignored"));
+                return;
+            }
+            match cx.editor.reload_document(doc_id) {
+                Ok(()) => cx.editor.set_status(format!("{path_str} reloaded")),
+                Err(err) => cx
+                    .editor
+                    .set_error(format!("{path_str} reload failed: {err}")),
             }
         },
     );
@@ -300,22 +250,28 @@ fn prompt_reload_modified(compositor: &mut Compositor, doc_id: DocumentId, path_
 }
 
 pub(super) fn register_hooks(handlers: &Handlers, config: &Config) {
-    // Register handler for FileSystemDidChange events (from filesentry)
-    let handler = Arc::new(ReloadHandler {
-        enable: config.auto_reload.enable.into(),
-        prompt_if_modified: config.auto_reload.prompt_if_modified.into(),
-    });
-    let handler_ = handler.clone();
     register_hook!(move |event: &mut ConfigDidChange<'_>| {
-        handler_.refresh_config(event.new);
+        // A shorter interval applies now rather than after the poll already
+        // scheduled, and turning polling back on restarts it.
+        schedule_poll(&event.editor.handlers, event.new);
         Ok(())
     });
     register_hook!(move |event: &mut FileSystemDidChange| {
-        handler.on_file_did_change(event);
+        on_file_did_change(event);
+        Ok(())
+    });
+    // A write between Helix reading a file and the watcher's first crawl
+    // reaching it is never reported, so check once the crawl is done.
+    let poll = handlers.auto_reload.clone();
+    register_hook!(move |_event: &mut WatchRootCrawled| {
+        send_blocking(&poll, AutoReloadEvent::PollAfter { interval: 0 });
         Ok(())
     });
 
-    // Start polling if enabled
+    schedule_poll(handlers, config);
+}
+
+fn schedule_poll(handlers: &Handlers, config: &Config) {
     if config.auto_reload.enable && config.auto_reload.poll.enable {
         send_blocking(
             &handlers.auto_reload,

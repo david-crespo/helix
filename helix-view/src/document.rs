@@ -215,10 +215,13 @@ pub struct Document {
     // were no saves.
     pub last_saved_time: SystemTime,
 
-    /// On-disk mtime of the last external change auto-reload already surfaced for
-    /// this document (prompt/warning). Lets it show the conflict once instead of
-    /// re-prompting on every poll/focus check while the buffer stays modified.
-    pub auto_reload_seen_mtime: Option<SystemTime>,
+    /// The on-disk mtime of the last external change auto-reload reported and
+    /// didn't take, and whether the buffer had unsaved changes then: if so it
+    /// was a conflict, and if not a reload that failed. Either is reported once
+    /// instead of on every poll and focus check. It stops applying when the
+    /// buffer's unsaved changes come or go, so a conflicted buffer undone back
+    /// to unmodified is reloaded.
+    pub auto_reload_reported: Option<(SystemTime, bool)>,
 
     last_saved_revision: usize,
     version: i32, // should be usize?
@@ -656,6 +659,16 @@ fn read_and_detect_encoding<R: std::io::Read + ?Sized>(
     Ok((encoding, has_bom, decoder, read))
 }
 
+/// Opens the file to read a document from, with the mtime to record for what
+/// is read. The mtime is taken before the read, not after: a write that lands
+/// during or after the read then leaves a newer mtime than this one, and the
+/// next check reloads rather than keeping what may be a partial read.
+fn open_with_mtime(path: &Path) -> std::io::Result<(std::fs::File, SystemTime)> {
+    let file = std::fs::File::open(path)?;
+    let mtime = file.metadata().and_then(|meta| meta.modified());
+    Ok((file, mtime.unwrap_or_else(|_| SystemTime::now())))
+}
+
 // The documentation and implementation of this function should be up-to-date with
 // its sibling function, `from_reader()`.
 //
@@ -783,7 +796,7 @@ impl Document {
             history: Cell::new(History::default()),
             savepoints: Vec::new(),
             last_saved_time: SystemTime::now(),
-            auto_reload_seen_mtime: None,
+            auto_reload_reported: None,
             last_saved_revision: 0,
             modified_since_accessed: false,
             language_servers: HashMap::new(),
@@ -841,15 +854,16 @@ impl Document {
         encoding = encoding.or(editor_config.encoding);
 
         // Open the file if it exists, otherwise assume it is a new file (and thus empty).
-        let (rope, encoding, has_bom) = if path.exists() {
-            let mut file = std::fs::File::open(path)?;
-            from_reader(&mut file, encoding)?
+        let (rope, encoding, has_bom, mtime) = if path.exists() {
+            let (mut file, mtime) = open_with_mtime(path)?;
+            let (rope, encoding, has_bom) = from_reader(&mut file, encoding)?;
+            (rope, encoding, has_bom, Some(mtime))
         } else {
             let line_ending = editor_config
                 .line_ending
                 .unwrap_or_else(|| config.load().default_line_ending.into());
             let encoding = encoding.unwrap_or(encoding::UTF_8);
-            (Rope::from(line_ending.as_str()), encoding, false)
+            (Rope::from(line_ending.as_str()), encoding, false, None)
         };
 
         let loader = syn_loader.load();
@@ -857,6 +871,10 @@ impl Document {
 
         // set the path and try detecting the language
         doc.set_path(Some(path));
+        // `set_path` took the mtime the file has now, after the read.
+        if let Some(mtime) = mtime {
+            doc.last_saved_time = mtime;
+        }
         if detect_language {
             doc.detect_language(&loader);
         }
@@ -1331,17 +1349,20 @@ impl Document {
         // Once we have a valid path we check if its readonly status has changed
         self.detect_readonly();
 
-        let mut file = std::fs::File::open(&path)?;
+        let (mut file, mtime) = open_with_mtime(&path)?;
         let (rope, ..) = from_reader(&mut file, Some(encoding))?;
 
         // Calculate the difference between the buffer and source text, and apply it.
         // This is not considered a modification of the contents of the file regardless
         // of the encoding.
         let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
+        // An unfinished insert goes into the history first, so that undo takes back the reload
+        // alone.
+        self.append_changes_to_history(view);
         self.apply(&transaction, view.id);
         self.append_changes_to_history(view);
         self.reset_modified();
-        self.pickup_last_saved_time();
+        self.last_saved_time = mtime;
         self.detect_indent_and_line_ending();
 
         match provider_registry.get_diff_base(&path, trust_full) {

@@ -4003,7 +4003,7 @@ dependencies = [
 [[package]]
 name = "termina"
 version = "0.4.0"
-source = "git+https://github.com/david-crespo/termina?branch=helix#a404b67d88f19543d729f3a907c4d0b1381758cb"
+source = "git+https://github.com/david-crespo/termina?branch=helix#b9112e021a5b884bbfd8efb34a2ab52050b73181"
 dependencies = [
  "bitflags 2.13.0",
  "futures-core",

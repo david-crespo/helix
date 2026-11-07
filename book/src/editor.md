@@ -258,7 +258,7 @@ Note that the ignore files consulted by the file explorer when `ignore` is set t
 
 Controls the file watcher, which reports changes made to files outside of Helix. Open buffers are [reloaded](#editorauto-reload-section), language servers that ask for file events get them, and the diff gutter follows the checked-out commit.
 
-The watcher watches the workspace: the directory Helix was started in or the nearest directory above it with a `.git`, `.jj`, `.svn` or `.helix` directory. It also watches directories outside the workspace that language servers ask for. Ignored files and directories are not watched. Patterns in `.helix/filesentryignore` in the workspace and `filesentryignore` in the configuration directory, in `.gitignore` syntax, apply to the watcher alone, and a negated pattern there (`!target`) watches something another ignore file excludes.
+The watcher watches the workspace: the directory Helix was started in or the nearest directory above it with a `.git`, `.jj`, `.svn` or `.helix` directory. It also watches directories outside the workspace that language servers ask for, other than directories above the workspace or the home directory. Ignored files and directories are not watched. Patterns in `.helix/filesentryignore` in the workspace and `filesentryignore` in the configuration directory, in `.gitignore` syntax, apply to the watcher alone, and a negated pattern there (`!target`) watches something another ignore file excludes.
 
 | Key | Description | Default |
 |--|--|---------|

@@ -292,7 +292,12 @@ impl Watcher {
             return;
         }
         let (workspace, _) = helix_loader::find_workspace();
-        if root.starts_with(&workspace) {
+        // `root` has symlinks resolved, so the home directory needs it too.
+        let home = helix_stdx::path::home_dir()
+            .ok()
+            .and_then(|home| home.canonicalize().ok());
+        if !watches_lsp_root(&root, &workspace, home.as_deref()) {
+            log::debug!("not watching language server root {root:?}");
             return;
         }
         self.roots.insert(root);
@@ -314,6 +319,21 @@ fn dispatcher<E: helix_event::Event>() -> impl Fn(E) + Send + 'static {
         let _guard = runtime.as_ref().map(|runtime| runtime.enter());
         dispatch(event);
     }
+}
+
+/// Whether a root a language server asks for gets a watch of its own. One in
+/// the workspace is watched already. Servers also ask for roots too wide to
+/// crawl: tsgo 7.0 registers `/users/**/*` for a project under /Users with no
+/// package.json, and crawling all of /Users kept hx at 40-70% CPU. So a root
+/// above the workspace isn't watched, and a server sees changes there only to
+/// files open in Helix. Nor is the home directory or a root above it, which a
+/// server can ask for when the workspace is outside the home directory. What's
+/// left is mostly path dependencies, like a `[patch]` to `../progenitor`, so
+/// rust-analyzer sees changes made to them from outside Helix.
+fn watches_lsp_root(root: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+    !root.starts_with(workspace)
+        && !workspace.starts_with(root)
+        && !home.is_some_and(|home| home.starts_with(root))
 }
 
 /// The real path of a file, or for one not written yet, of its directory
@@ -689,6 +709,35 @@ mod tests {
         assert!(is_hidden(Path::new(".foo")));
         // handled by vcs ignore rules
         assert!(!is_hidden(Path::new(".git")));
+    }
+
+    /// Language servers ask for roots too wide to crawl, like tsgo's `/users`
+    /// for a project with no package.json. Only roots outside the workspace
+    /// and not above it get watched.
+    #[test]
+    fn watches_lsp_roots_beside_workspace() {
+        use crate::file_watcher::watches_lsp_root;
+
+        let home = Some(Path::new("/Users/me"));
+        let workspace = Path::new("/Users/me/repos/app");
+        let watches = |dir: &str| watches_lsp_root(Path::new(dir), workspace, home);
+
+        assert!(watches("/Users/me/repos/progenitor"));
+        assert!(watches("/Users/me/.cargo/registry/src/foo"));
+        // in the workspace, which is watched already
+        assert!(!watches("/Users/me/repos/app"));
+        assert!(!watches("/Users/me/repos/app/src"));
+        // above the workspace
+        assert!(!watches("/Users"));
+        assert!(!watches("/"));
+
+        // The home directory and what is above it are too wide as well, when
+        // the workspace is somewhere else.
+        let workspace = Path::new("/private/tmp/scratch");
+        let watches = |dir: &str| watches_lsp_root(Path::new(dir), workspace, home);
+        assert!(watches("/Users/me/repos/progenitor"));
+        assert!(!watches("/Users/me"));
+        assert!(!watches("/Users"));
     }
 
     #[test]

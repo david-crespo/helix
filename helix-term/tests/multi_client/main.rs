@@ -152,6 +152,28 @@ fn picker_results_show_with_another_client_attached() {
     b.wait_for("found.txt:1");
 }
 
+/// Global search lists paths relative to the client's directory, and the preview reads them
+/// from there, not from the directory the server started in.
+#[test]
+fn global_search_previews_files_in_the_clients_directory() {
+    let env = Env::new();
+    env.write("p1/other.txt", "");
+    env.write("p2/found.txt", "needle in p2\n");
+    let a = env.client_in(&env.path("p1"), &[]);
+    a.wait_for("NOR");
+    a.command(&format!("cd {}", env.path("p2").display()));
+
+    a.keys("<space>/needle");
+    a.wait_for("found.txt:1");
+    a.wait_for("needle in p2");
+
+    // And the result opens from there.
+    a.keys("<ret>");
+    a.wait_until("the file to open", |_| {
+        a.status_line().contains("found.txt")
+    });
+}
+
 #[test]
 fn piped_stdin_opens_only_in_that_client() {
     let env = Env::new();

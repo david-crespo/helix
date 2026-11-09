@@ -591,6 +591,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         match path_or_id {
             PathOrId::Path(path) => {
+                // Items may hold paths relative to Helix's working directory, which isn't
+                // always the process's.
+                let path = &*helix_stdx::path::canonicalize(path);
                 if let Some(doc) = editor.document_by_path(path) {
                     return Some((Preview::EditorDocument(doc), range));
                 }

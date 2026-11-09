@@ -87,11 +87,12 @@ as they would be without sessions.
   environment of the terminal they were run from, so tools like direnv work
   per terminal. So do Steel plugins: `env-var`, `maybe-get-env-var` and the
   processes `command` starts see the environment and working directory of the
-  terminal the plugin code runs for. Variables in paths, as in `:open
-  $NOTES/todo.md` or under `gf`, come from the terminal's environment too, and
-  formatters and debug adapters are looked up on its `PATH`. Language servers
-  are shared, so they are looked up and run with the environment the server
-  started with, which is that of the session's first terminal.
+  terminal the plugin code runs for, and a thread a plugin starts keeps them.
+  Variables in paths, as in `:open $NOTES/todo.md` or under `gf`, come from
+  the terminal's environment too, and formatters and debug adapters are looked
+  up on its `PATH`. Language servers are shared, so they are looked up and run
+  with the environment the server started with, which is that of the session's
+  first terminal.
 - **Theme.** `:theme` changes the theme of the current terminal, and a theme
   with separate light and dark variants follows each terminal's own setting.
 - **Messages.** The result of a command, such as a save, shows in the terminal

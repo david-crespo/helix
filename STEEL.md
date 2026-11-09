@@ -299,6 +299,7 @@ With `editor.session = "auto"`, every `hx` in a workspace joins one shared edito
 * Hooks run as the client that caused the event, such as the one whose edit fired `document-changed`. Events no client caused, such as those from language servers, run as the client that last had input.
 * Timers and callbacks (`enqueue-thread-local-callback`, `await-callback` and the like) run as the client that set them up. If it has left by then, they run as the client that last had input, but what they do to the UI, such as pushing a component, is dropped. Those set up by `init.scm` follow whichever client last had input.
 * Work handed back from another thread with `hx.with-context` runs as the client that last had input. Use `with-client` to pick one.
+* A thread started with `spawn-native-thread` keeps the working directory and environment of the client that started it, as they were then: `env-var`, `current-directory`, the file functions and the processes `command` starts use those, whichever client has input by the time the thread gets to them.
 
 A standalone editor has a single client, so none of this changes anything there. These functions in `helix/editor.scm` deal with clients, which are integers:
 

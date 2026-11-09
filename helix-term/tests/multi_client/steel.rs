@@ -255,3 +255,118 @@ fn steel_uses_the_client_environment() {
     b.command("who");
     b.wait_for("bravo bravo, spawned bravo in sub");
 }
+
+/// A thread a plugin starts keeps the environment and working directory of the client that
+/// started it, whichever client is in use by the time it reads them.
+#[test]
+fn native_thread_keeps_its_clients_environment() {
+    let env = steel_env(
+        r#"(require "helix/ext.scm")
+(define (who-later)
+  (define client (current-client))
+  (spawn-native-thread
+    (lambda ()
+      (time/sleep-ms 1000)
+      (let* ([child (Ok->value (spawn-process (with-stdout-piped
+               (command "sh" (list "-c" "printf '%s in %s' \"$WHO\" \"$(basename \"$(pwd -P)\")\"")))))]
+             [spawned (read-port-to-string (child-stdout child))]
+             [status (string-append "thread saw " (env-var "WHO") ", spawned " spawned)])
+        (hx.with-context (lambda () (with-client client (lambda () (set-status! status))))))))
+  (set-status! "started"))"#,
+    );
+    env.write("sub/c.txt", "c\n");
+    let a = env.client_with(&env.project(), &[("WHO", "alpha")], &["a.txt"]);
+    let b = env.client_with(&env.path("sub"), &[("WHO", "bravo")], &["c.txt"]);
+
+    a.command("who-later");
+    a.wait_for("started");
+    b.keys("l");
+    a.wait_for("thread saw alpha, spawned alpha in project");
+}
+
+/// An environment where client A, in `p1`, starts the server and client B is in `p2`.
+fn two_directories(init: &str) -> (Env, crate::harness::Client, crate::harness::Client) {
+    let env = steel_env(init);
+    env.write("p1/other.txt", "");
+    env.write("p2/sub/only-in-p2.txt", "");
+    let a = env.client_in(&env.path("p1"), &[]);
+    a.wait_for("NOR");
+    let b = env.client_in(&env.path("p2"), &[]);
+    b.wait_for("NOR");
+    (env, a, b)
+}
+
+/// Steel's file functions take paths relative to the directory of the client the code runs
+/// as, not the server's, whether they come from the prelude or their module.
+#[test]
+fn file_functions_use_the_clients_directory() {
+    let (_env, _a, b) = two_directories(
+        r#"(require-builtin steel/filesystem as fs.)
+(define (found? path) (if path "yes" "no"))
+(define (look)
+  (set-status! (string-append "prelude " (found? (path-exists? "sub/only-in-p2.txt"))
+                              ", module " (found? (fs.path-exists? "sub/only-in-p2.txt"))
+                              ", listed " (found? (= 1 (length (read-dir "sub")))))))"#,
+    );
+    b.command("look");
+    b.wait_for("prelude yes, module yes, listed yes");
+}
+
+#[test]
+fn changing_directory_moves_only_that_client() {
+    let (_env, a, b) = two_directories(
+        r#"(define (go)
+  (change-current-directory! "sub")
+  (set-status! (string-append "now in " (file-name (current-directory)))))
+(define (where) (set-status! (string-append "still in " (file-name (current-directory)))))"#,
+    );
+    b.command("go");
+    b.wait_for("now in sub");
+    b.command("sh basename \"$PWD\"");
+    b.wait_for("sub");
+    a.command("where");
+    a.wait_for("still in p1");
+}
+
+/// The replaced process and environment functions also reach code that takes them from their
+/// modules.
+#[test]
+fn module_imports_use_the_client_environment() {
+    let env = steel_env(
+        r#"(require-builtin steel/process as proc.)
+(require-builtin steel/meta as meta.)
+(define (who)
+  (let* ([child (Ok->value (spawn-process (with-stdout-piped
+           (proc.command "sh" (list "-c" "printf '%s in %s' \"$WHO\" \"$(basename \"$(pwd -P)\")\"")))))]
+         [spawned (read-port-to-string (child-stdout child))])
+    (set-status! (string-append (meta.env-var "WHO") ", spawned " spawned))))"#,
+    );
+    env.write("sub/c.txt", "c\n");
+    let a = env.client_with(&env.project(), &[("WHO", "alpha")], &["a.txt"]);
+    let b = env.client_with(&env.path("sub"), &[("WHO", "bravo")], &["c.txt"]);
+
+    a.command("who");
+    a.wait_for("alpha, spawned alpha in project");
+    b.command("who");
+    b.wait_for("bravo, spawned bravo in sub");
+}
+
+#[test]
+fn load_takes_a_path_in_the_clients_directory() {
+    let (env, _a, b) = two_directories(r#"(define (run) (load "sub/snippet.scm"))"#);
+    env.write("p2/sub/snippet.scm", r#"(set-status! "loaded from p2")"#);
+    b.command("run");
+    b.wait_for("loaded from p2");
+}
+
+/// Without a server, the file functions pass paths through as given, so what they return
+/// stays relative.
+#[test]
+fn standalone_file_functions_keep_relative_paths() {
+    let env = steel_env(r#"(define (list-sub) (set-status! (car (read-dir "sub"))))"#);
+    env.write("sub/only.txt", "");
+    let a = env.client(&["--no-session"]);
+    a.command("list-sub");
+    a.wait_for("sub/only.txt");
+    assert!(!a.screen().contains("/sub/only.txt"));
+}

@@ -4303,10 +4303,15 @@ fn fuzzy_match(pattern: SteelString, items: SteelVal) -> Vec<SteelVal> {
     Vec::new()
 }
 
-/// Replaces Steel's primitives that read the environment or spawn processes with ones that
-/// use the environment and working directory Helix's own commands do (see
+/// Replaces Steel's primitives that read the environment, spawn processes or take file paths
+/// with ones that use the environment and working directory Helix's own commands do (see
 /// [`helix_stdx::env::command`]). With several clients sharing the editor, those are the
 /// client's that the code runs as, not the server process's.
+///
+/// Not covered: `require` of a relative path from code that has no file of its own, such as an
+/// expression typed at the prompt. Steel's module compiler resolves that against the process's
+/// directory, which in a server is the root directory, so the file isn't found. Fixing it
+/// needs a change in Steel. `require` in a file is relative to that file and isn't affected.
 fn use_client_environment(engine: &mut Engine) {
     use steel::primitives::process;
 
@@ -4336,9 +4341,43 @@ fn use_client_environment(engine: &mut Engine) {
         process::current_dir(builder, cwd.to_string_lossy().into_owned())
     }
 
+    /// `path` as a server has to spell it for the operating system to find it in the client's
+    /// directory. Standalone it's left alone, so results that repeat it stay relative.
+    fn client_path(path: String) -> String {
+        if helix_stdx::env::environment().is_none() {
+            return path;
+        }
+        let path = helix_stdx::env::current_working_dir().join(path);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn current_directory() -> String {
+        let cwd = helix_stdx::env::current_working_dir();
+        cwd.to_string_lossy().into_owned()
+    }
+
+    fn change_directory(cx: &mut Context, path: String) -> Result<(), SteelErr> {
+        let changed = cx.editor.set_cwd(std::path::Path::new(&path));
+        changed.map_err(|err| SteelErr::new(ErrorKind::Generic, err.to_string()))
+    }
+
+    /// The working directory and environment of the client that code runs as, for a thread it
+    /// starts to keep.
+    #[derive(Clone)]
+    struct ClientEnv(helix_stdx::env::Snapshot);
+    impl Custom for ClientEnv {}
+
     engine
+        .register_fn("#%client-env", || {
+            ClientEnv(helix_stdx::env::Snapshot::capture())
+        })
+        .register_fn("#%adopt-client-env", |env: ClientEnv| env.0.adopt())
         .register_fn("env-var", env_var)
-        .register_fn("command", command);
+        .register_fn("command", command)
+        .register_fn("#%client-path", client_path)
+        .register_fn("#%change-directory", change_directory)
+        .register_fn("current-directory", current_directory);
+
     // Steel's own wraps `env-var` in a `Result`, which only Scheme code can make.
     let maybe_get_env_var = engine
         .compile_and_run_raw_program(
@@ -4348,6 +4387,83 @@ fn use_client_environment(engine: &mut Engine) {
         .and_then(|mut values| values.pop())
         .expect("maybe-get-env-var compiles");
     engine.register_value("maybe-get-env-var", maybe_get_env_var);
+
+    // Steel's file functions hand their paths to the operating system, which resolves relative
+    // ones against the server's directory. These wrap them to resolve the paths first.
+    let mut replaced = vec![
+        "env-var",
+        "maybe-get-env-var",
+        "command",
+        "current-directory",
+    ];
+    let mut wrap = |name: &'static str, wrapper: &str| {
+        let wrapped = engine
+            .compile_and_run_raw_program(format!("(let ((steel {name})) {wrapper})"))
+            .ok()
+            .and_then(|mut values| values.pop())
+            .unwrap_or_else(|| panic!("the wrapper for {name} compiles"));
+        engine.register_value(name, wrapped);
+        replaced.push(name);
+    };
+    for name in [
+        "canonicalize-path",
+        "create-directory!",
+        "delete-directory!",
+        "delete-file!",
+        "file-metadata",
+        "glob",
+        "is-dir?",
+        "is-file?",
+        "load",
+        "open-input-file",
+        "open-output-file",
+        "path-exists?",
+        "read-dir",
+        "read-dir-iter",
+    ] {
+        wrap(
+            name,
+            "(lambda (path . rest) (apply steel (#%client-path path) rest))",
+        );
+    }
+    for name in ["copy-directory-recursively!", "rename-file-or-directory!"] {
+        wrap(
+            name,
+            "(lambda (from to) (steel (#%client-path from) (#%client-path to)))",
+        );
+    }
+    // The main thread may be on another client by the time a thread reads these.
+    wrap(
+        "spawn-native-thread",
+        "(lambda (thunk)
+           (let ((env (#%client-env)))
+             (steel (lambda () (#%adopt-client-env env) (thunk)))))",
+    );
+    wrap(
+        "change-current-directory!",
+        &format!("(lambda (path) (#%change-directory {CTX} path))"),
+    );
+
+    // Code that takes these from their module, with `require-builtin`, gets the replacements
+    // too.
+    for module in [
+        "steel/filesystem",
+        "steel/ports",
+        "steel/process",
+        "steel/meta",
+        "steel/threads",
+    ] {
+        let mut module = engine
+            .builtin_modules()
+            .get(module)
+            .expect("a Steel module");
+        for name in &replaced {
+            if module.contains(name) {
+                let value = engine.extract_value(name).expect("a replaced function");
+                module.register_value(name, value);
+            }
+        }
+    }
 }
 
 fn configure_engine_impl(mut engine: Engine) -> Engine {

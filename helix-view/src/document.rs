@@ -177,6 +177,9 @@ pub struct Document {
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
+    /// What `relative_path` held in other working directories, for when one of them is the
+    /// working directory again: a server switches between its clients' with every frame.
+    relative_paths_elsewhere: Vec<(Arc<Path>, Option<PathBuf>)>,
     /// Lazily-computed workspace root for this document (the ancestor that contains a `.git` /
     /// `.svn` / `.jj` / `.helix`). Avoids per-call `find_workspace_in` ancestor walks for hot
     /// consumers like the statusline trust indicator, LSP launch, and DAP launch. Taken in
@@ -392,9 +395,18 @@ impl fmt::Debug for DocumentInlayHintsId {
 }
 
 impl Editor {
-    pub(crate) fn clear_doc_relative_paths(&mut self) {
+    /// Has documents give their paths relative to the working directory `to` instead of
+    /// `from`, which was the working directory until now.
+    pub(crate) fn switch_doc_relative_paths(&mut self, from: &Path, to: &Path) {
+        let from: Arc<Path> = from.into();
         for doc in self.documents_mut() {
-            doc.relative_path.take();
+            if let Some(path) = doc.relative_path.take() {
+                doc.relative_paths_elsewhere.push((from.clone(), path));
+            }
+            let elsewhere = &mut doc.relative_paths_elsewhere;
+            if let Some(i) = elsewhere.iter().position(|(cwd, _)| **cwd == *to) {
+                let _ = doc.relative_path.set(elsewhere.swap_remove(i).1);
+            }
         }
     }
 }
@@ -774,6 +786,7 @@ impl Document {
             active_snippet: None,
             path: None,
             relative_path: OnceCell::new(),
+            relative_paths_elsewhere: Vec::new(),
             workspace_root: OnceCell::new(),
             encoding,
             has_bom,
@@ -1399,6 +1412,7 @@ impl Document {
         // `take` to remove any prior relative path that may have existed.
         // This will get set in `relative_path()`.
         self.relative_path.take();
+        self.relative_paths_elsewhere.clear();
         // Same story: invalidate so the next workspace_root() recomputes against the new path.
         self.workspace_root.take();
 

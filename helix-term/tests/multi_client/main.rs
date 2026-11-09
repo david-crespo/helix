@@ -230,6 +230,25 @@ fn working_dir_argument_is_relative_to_where_the_client_started() {
     b.wait_for("sub");
 }
 
+/// Each client sees a document's path relative to its own directory.
+#[test]
+fn buffer_name_is_relative_to_each_clients_directory() {
+    let env = Env::new();
+    env.write("alpha/shared.txt", "shared\n");
+    env.write("beta/other.txt", "");
+    let a = env.client_in(&env.path("alpha"), &["shared.txt"]);
+    a.wait_for("shared");
+    let b = env.client_in(&env.path("beta"), &["../alpha/shared.txt"]);
+    b.wait_for("shared");
+
+    a.command("sh echo \"[%{buffer_name}]\"");
+    a.wait_for("[shared.txt]");
+    b.command("sh echo \"[%{buffer_name}]\"");
+    b.wait_until("the full path", |screen| {
+        screen.contains("alpha/shared.txt]") && !screen.contains("[shared.txt]")
+    });
+}
+
 #[test]
 fn piped_stdin_opens_only_in_that_client() {
     let env = Env::new();

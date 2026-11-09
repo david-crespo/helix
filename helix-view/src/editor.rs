@@ -1822,7 +1822,12 @@ impl Editor {
             .parked_clients
             .remove(&client)
             .expect("client has state");
+        let cwd = helix_stdx::env::current_working_dir();
         state.swap(self);
+        let new_cwd = helix_stdx::env::current_working_dir();
+        if new_cwd != cwd {
+            self.switch_doc_relative_paths(&cwd, &new_cwd);
+        }
         self.parked_clients.insert(active, state);
         self.tree.activate(client);
     }
@@ -3067,8 +3072,9 @@ impl Editor {
     }
 
     pub fn set_cwd(&mut self, path: &Path) -> std::io::Result<()> {
+        let cwd = helix_stdx::env::current_working_dir();
         self.last_cwd = helix_stdx::env::set_current_working_dir(path)?;
-        self.clear_doc_relative_paths();
+        self.switch_doc_relative_paths(&cwd, &helix_stdx::env::current_working_dir());
         Ok(())
     }
 

@@ -654,6 +654,7 @@ pub mod completers {
 
             (path, file_name)
         };
+        let dir = helix_stdx::path::canonicalize(dir);
 
         let end = input.len()..;
 

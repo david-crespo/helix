@@ -1398,6 +1398,15 @@ fn resolve_document_link_request(
     language_server.resolve_document_link(link.link.clone())
 }
 
+/// The directory that relative paths in `doc` start from: the document's own, or the working
+/// directory for a scratch buffer.
+fn base_dir(doc: &Document) -> PathBuf {
+    match doc.path().and_then(|path| path.parent()) {
+        Some(dir) => dir.to_path_buf(),
+        None => helix_stdx::env::current_working_dir(),
+    }
+}
+
 /// Goto files/URLs in selection.
 ///
 /// Prefers LSP document links when the cursor/selection overlaps a link range,
@@ -1406,10 +1415,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
     let (view, doc) = current_ref!(cx.editor);
     let text = doc.text().clone();
     let selections = doc.selection(view.id).ranges().to_vec();
-    let rel_path = doc
-        .relative_path()
-        .map(|path| path.parent().unwrap().to_path_buf())
-        .unwrap_or_default();
+    let base_dir = base_dir(doc);
     let text = text.slice(..);
 
     let mut lsp_targets = Vec::new();
@@ -1449,7 +1455,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
     }
 
     if !resolve_requests.is_empty() {
-        let rel_path = rel_path.clone();
+        let base_dir = base_dir.clone();
         cx.jobs.callback(async move {
             let mut targets = Vec::new();
             let mut seen = HashSet::new();
@@ -1472,7 +1478,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
             Ok(Callback::EditorCompositor(Box::new(
                 move |editor, compositor| {
                     for target in targets {
-                        open_url_in_callback(editor, compositor, target, action, &rel_path);
+                        open_url_in_callback(editor, compositor, target, action, &base_dir);
                     }
                 },
             )))
@@ -1521,7 +1527,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         }
 
         let path = path::expand(&sel);
-        let path = &rel_path.join(path);
+        let path = &base_dir.join(path);
         if path.is_dir() {
             let picker = ui::file_picker(cx.editor, path.into());
             cx.push_layer(Box::new(overlaid(picker)));
@@ -1535,16 +1541,13 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
 /// Otherwise, the file is open using external program.
 fn open_url(cx: &mut Context, url: Url, action: Action) {
     let doc = doc!(cx.editor);
-    let rel_path = doc
-        .relative_path()
-        .map(|path| path.parent().unwrap().to_path_buf())
-        .unwrap_or_default();
+    let base_dir = base_dir(doc);
 
     if should_open_url_externally(&url) {
         return cx.jobs.callback(crate::open_external_url_callback(url));
     }
 
-    let path = &rel_path.join(url.path());
+    let path = &base_dir.join(url.path());
     if path.is_dir() {
         let picker = ui::file_picker(cx.editor, path.into());
         cx.push_layer(Box::new(overlaid(picker)));
@@ -1563,7 +1566,7 @@ fn open_url_in_callback(
     compositor: &mut Compositor,
     url: Url,
     action: Action,
-    rel_path: &Path,
+    base_dir: &Path,
 ) {
     if should_open_url_externally(&url) {
         helix_event::client::spawn(async move {
@@ -1575,7 +1578,7 @@ fn open_url_in_callback(
         return;
     }
 
-    let path = &rel_path.join(url.path());
+    let path = &base_dir.join(url.path());
     if path.is_dir() {
         let picker = ui::file_picker(editor, path.into());
         compositor.push(Box::new(overlaid(picker)));

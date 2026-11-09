@@ -174,6 +174,62 @@ fn global_search_previews_files_in_the_clients_directory() {
     });
 }
 
+/// A client whose directory isn't the server's: the server starts in `p1` and the client moves
+/// to `p2`, where `sub/inner.txt` is.
+fn client_moved_to_p2() -> (Env, Client) {
+    let env = Env::new();
+    env.write("p1/other.txt", "");
+    env.write("p2/note.txt", "from note\n");
+    env.write("p2/sub/inner.txt", "");
+    let a = env.client_in(&env.path("p1"), &[]);
+    a.wait_for("NOR");
+    a.command(&format!("cd {}", env.path("p2").display()));
+    (env, a)
+}
+
+#[test]
+fn read_takes_a_path_in_the_clients_directory() {
+    let (_env, a) = client_moved_to_p2();
+    a.command("read note.txt");
+    a.wait_for("from note");
+}
+
+#[test]
+fn move_takes_a_directory_in_the_clients_directory() {
+    let (env, a) = client_moved_to_p2();
+    a.command("o note.txt");
+    a.wait_for("from note");
+    a.command("move sub");
+    wait_until("the file to move", || env.path("p2/sub/note.txt").exists());
+}
+
+#[test]
+fn command_line_completes_paths_in_the_clients_directory() {
+    let (_env, a) = client_moved_to_p2();
+    a.keys(":o sub/");
+    a.wait_for("inner.txt");
+}
+
+#[test]
+fn goto_file_finds_a_directory_in_the_clients_directory() {
+    let (_env, a) = client_moved_to_p2();
+    a.keys("isub<esc>gf");
+    a.wait_for("inner.txt");
+}
+
+#[test]
+fn working_dir_argument_is_relative_to_where_the_client_started() {
+    let env = Env::new();
+    env.write("p2/sub/inner.txt", "");
+    let a = env.client(&[]);
+    a.wait_for("NOR");
+    let b = env.client_in(&env.path("p2"), &["-w", "sub"]);
+    b.wait_for("NOR");
+
+    b.command("sh basename \"$PWD\"");
+    b.wait_for("sub");
+}
+
 #[test]
 fn piped_stdin_opens_only_in_that_client() {
     let env = Env::new();

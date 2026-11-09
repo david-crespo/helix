@@ -2,7 +2,7 @@ use anyhow::Result;
 use helix_core::Position;
 use helix_view::tree::Layout;
 use indexmap::IndexMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct Args {
@@ -112,8 +112,9 @@ impl Args {
                 },
                 "-w" | "--working-dir" => match argv.next().as_deref() {
                     Some(path) => {
-                        args.working_directory = if Path::new(path).is_dir() {
-                            Some(PathBuf::from(path))
+                        let path = helix_stdx::path::canonicalize(path);
+                        args.working_directory = if path.is_dir() {
+                            Some(path)
                         } else {
                             anyhow::bail!(
                                 "--working-dir specified does not exist or is not a directory"
@@ -171,7 +172,7 @@ impl Args {
 /// Parse arg into [`PathBuf`] and position.
 pub(crate) fn parse_file(s: &str) -> (PathBuf, Position) {
     let def = || (PathBuf::from(s), Position::default());
-    if Path::new(s).exists() {
+    if helix_stdx::path::canonicalize(s).exists() {
         return def();
     }
     split_path_row_col(s)

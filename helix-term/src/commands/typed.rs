@@ -2905,6 +2905,7 @@ fn move_buffer_impl(
         .map(ToOwned::to_owned)
         .context("Scratch buffer cannot be moved. Use :write instead")?;
 
+    let new_path = helix_stdx::path::canonicalize(new_path);
     // if new_path is a directory, append the original file name
     // to move the file into that directory.
     let new_path = old_path
@@ -2982,7 +2983,7 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     let (view, doc) = current!(cx.editor);
 
     let filename = args.first().unwrap();
-    let path = helix_stdx::path::expand_tilde(PathBuf::from(filename.to_string()));
+    let path = helix_stdx::path::canonicalize(filename);
 
     ensure!(
         path.exists() && path.is_file(),

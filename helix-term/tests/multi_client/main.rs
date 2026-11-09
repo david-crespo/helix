@@ -137,6 +137,21 @@ fn path_completion_lists_the_clients_directory() {
     b.wait_for("only-in-p2.txt");
 }
 
+/// A picker that is still matching asks for another frame while it draws. Drawing the other
+/// client's frame mustn't drop that request, or the results never show.
+#[test]
+fn picker_results_show_with_another_client_attached() {
+    let env = Env::new();
+    env.write("found.txt", "needle\n");
+    let a = env.client(&[]);
+    a.wait_for("NOR");
+    let b = env.client(&[]);
+    b.wait_for("NOR");
+
+    b.keys("<space>/needle");
+    b.wait_for("found.txt:1");
+}
+
 #[test]
 fn piped_stdin_opens_only_in_that_client() {
     let env = Env::new();
@@ -528,6 +543,29 @@ fn stalled_terminal_holds_up_only_its_client() {
     }
     b.keys("ggiready<esc>");
     b.wait_for("readyabcdefghij");
+    drop(stalled);
+    a.wait_for("readyabcdefghij");
+}
+
+/// The same with no other client to draw for: the frames skipped while the terminal was behind
+/// are made up for once it reads again, without waiting for a key.
+#[test]
+fn stalled_terminal_of_a_lone_client_catches_up() {
+    let env = Env::new();
+    let line = "abcdefghij".repeat(9);
+    env.write("x.txt", &format!("{line}\n").repeat(30));
+    let a = env.client(&["x.txt"]);
+    a.wait_for("abcdefghij");
+
+    let stalled = a.stop_reading();
+    a.keys("%");
+    for _ in 0..60 {
+        a.keys("~");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Typing has completion ask for a redraw, which finds the terminal behind.
+    a.keys("ggiready");
+    std::thread::sleep(2 * harness::SETTLE);
     drop(stalled);
     a.wait_for("readyabcdefghij");
 }

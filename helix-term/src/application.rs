@@ -429,6 +429,14 @@ impl Application {
     }
 
     async fn render(&mut self) {
+        // Once for all clients, before any of them draws. A redraw one client's frame asks
+        // for, such as a picker still matching, would be lost if the next client's frame
+        // cleared the requests again.
+        helix_event::start_frame();
+        // Also once, and even if no client draws: left set by a frame that a client behind on
+        // its terminal skipped, it would keep the redraw for when it has caught up from being
+        // scheduled.
+        self.editor.needs_redraw = false;
         self.for_each_client(Self::render_client);
     }
 
@@ -447,9 +455,6 @@ impl Application {
             jobs: &mut self.jobs,
             scroll: None,
         };
-
-        helix_event::start_frame();
-        cx.editor.needs_redraw = false;
 
         let area = self
             .terminal

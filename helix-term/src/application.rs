@@ -1221,7 +1221,11 @@ impl Application {
                         // do nothing
                     }
                     Notification::Exit => {
-                        self.editor.set_status("Language server exited");
+                        // A server already out of the registry was stopped on purpose, by
+                        // `:lsp-stop`, `:lsp-restart`, or for having no documents.
+                        if self.editor.language_server_by_id(server_id).is_some() {
+                            self.editor.set_status("Language server exited");
+                        }
 
                         // LSPs may produce diagnostics for files that haven't been opened in helix,
                         // we need to clear those and remove the entries from the list if this leads to

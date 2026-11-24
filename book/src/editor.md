@@ -181,6 +181,7 @@ The following statusline elements can be configured:
 | `display-signature-help-docs` | Display docs under signature help popup             | `true`  |
 | `snippets`      | Enables snippet completions. Requires a server restart (`:lsp-restart`) to take effect after `:config-reload`/`:set`. | `true`  |
 | `goto-reference-include-declaration` | Include declaration in the goto references popup. | `true`  |
+| `unused-server-timeout` | Time in milliseconds a language server keeps running with no documents open before it's shut down. Opening a file that needs it starts it again. `0` keeps it running until Helix exits. | `300000` |
 
 [^1]: By default, a progress spinner is shown in the statusline beside the file path.
 

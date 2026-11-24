@@ -27,6 +27,7 @@ mod document_links;
 mod prompt;
 mod signature_help;
 mod snippet;
+mod unused_servers;
 mod workspace_trust;
 
 pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
@@ -42,6 +43,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     let word_index = word_index::Handler::spawn();
     let pull_diagnostics = PullDiagnosticsHandler::default().spawn();
     let pull_all_documents_diagnostics = PullAllDocumentsDiagnosticHandler::default().spawn();
+    let unused_servers = unused_servers::Handler::default().spawn();
 
     let handlers = Handlers {
         completions: helix_view::handlers::completion::CompletionHandler::new(event_tx),
@@ -54,6 +56,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
         pull_diagnostics,
         pull_all_documents_diagnostics,
         code_action_hint,
+        unused_servers,
     };
 
     helix_view::handlers::register_hooks(&handlers);

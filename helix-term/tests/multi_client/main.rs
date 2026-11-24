@@ -827,6 +827,153 @@ fn completion_shows_in_the_client_that_typed() {
     b.never_shows("alphabetical");
 }
 
+// Language servers with no documents
+
+/// A language server that answers `initialize` and `shutdown`, exits on `exit`, and logs
+/// `<pid> <method>` for each message it gets. A line with only a PID is a start.
+const ANSWERING_LS: &str = r#"#!/bin/sh
+echo $$ >> '{log}'
+cr=$(printf '\r')
+while IFS= read -r line; do
+  case "$line" in
+    Content-Length:*) len=${line#Content-Length: }; len=${len%"$cr"} ;;
+    "$cr")
+      body=$(dd bs=1 count="$len" 2>/dev/null)
+      method=$(printf '%s' "$body" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+      id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      echo "$$ $method" >> '{log}'
+      case "$method" in
+        initialize) result='{"capabilities":{}}' ;;
+        shutdown) result=null ;;
+        exit) exit 0 ;;
+        *) continue ;;
+      esac
+      reply="{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":$result}"
+      printf 'Content-Length: %d\r\n\r\n%s' "${#reply}" "$reply"
+      ;;
+  esac
+done
+"#;
+
+/// An environment whose `.fake` files start [`ANSWERING_LS`], with language servers stopped
+/// after `timeout_ms` without documents. Returns the server's log.
+fn fake_ls_env(timeout_ms: u64) -> (Env, std::path::PathBuf) {
+    let env = Env::with_languages(
+        r#"
+[[language]]
+name = "fake"
+scope = "source.fake"
+file-types = ["fake"]
+language-servers = ["fake-ls"]
+
+[language-server.fake-ls]
+command = "{root}/fake-ls"
+"#,
+    );
+    env.editor_config(&format!(
+        "[editor.lsp]\nunused-server-timeout = {timeout_ms}\n"
+    ));
+    let log = env.root().join("fake-ls.log");
+    env.script(
+        "fake-ls",
+        &ANSWERING_LS.replace("{log}", &log.display().to_string()),
+    );
+    env.write("x.fake", "x\n");
+    env.write("a.txt", "a\n");
+    (env, log)
+}
+
+/// The PIDs of the language servers started so far, in order.
+fn ls_starts(log: &std::path::Path) -> Vec<String> {
+    let log = std::fs::read_to_string(log).unwrap_or_default();
+    let starts = log.lines().filter(|line| !line.contains(' '));
+    starts.map(str::to_owned).collect()
+}
+
+/// Whether the server with this PID got the message.
+fn ls_got(log: &std::path::Path, pid: &str, method: &str) -> bool {
+    let log = std::fs::read_to_string(log).unwrap_or_default();
+    log.lines().any(|line| line == format!("{pid} {method}"))
+}
+
+/// Waits for the `n`th language server start to initialize, and returns its PID.
+fn wait_for_ls_start(log: &std::path::Path, n: usize) -> String {
+    wait_until("the language server to start", || ls_starts(log).len() == n);
+    let pid = ls_starts(log)[n - 1].clone();
+    wait_until("the language server to initialize", || {
+        ls_got(log, &pid, "initialized")
+    });
+    pid
+}
+
+/// Waits for the server to exit, and checks that it was told to.
+fn wait_for_ls_shutdown(log: &std::path::Path, pid: &str) {
+    wait_until("the language server to exit", || !is_alive(pid));
+    assert!(ls_got(log, pid, "shutdown"), "no shutdown request");
+    assert!(ls_got(log, pid, "exit"), "no exit notification");
+}
+
+/// Whether the process is running, not exited or a zombie.
+fn is_alive(pid: &str) -> bool {
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&ps.stdout);
+    ps.status.success() && !stat.trim().starts_with('Z')
+}
+
+/// A server whose last document went with a departed client shuts down after the timeout,
+/// and starts again for the next document that needs it.
+#[test]
+fn unused_language_server_stops_and_restarts() {
+    let (env, log) = fake_ls_env(200);
+    let mut a = env.client(&["x.fake"]);
+    let b = env.client(&["a.txt"]);
+    let pid = wait_for_ls_start(&log, 1);
+
+    a.command("q");
+    a.wait_exit();
+    wait_for_ls_shutdown(&log, &pid);
+    b.never_shows("Language server exited");
+
+    b.command("o x.fake");
+    wait_for_ls_start(&log, 2);
+}
+
+/// A document reopened within the timeout keeps the server it had.
+#[test]
+fn reopened_document_keeps_its_language_server() {
+    let (env, log) = fake_ls_env(1500);
+    let mut a = env.client(&["x.fake"]);
+    let b = env.client(&["a.txt"]);
+    let pid = wait_for_ls_start(&log, 1);
+
+    a.command("q");
+    a.wait_exit();
+    b.command("o x.fake");
+    b.wait_until("x.fake to open", |_| b.status_line().contains("x.fake"));
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(is_alive(&pid), "the language server was stopped");
+    assert_eq!(
+        ls_starts(&log).len(),
+        1,
+        "the language server was restarted"
+    );
+}
+
+/// Without a session, closing a server's last buffer stops it after the timeout too.
+#[test]
+fn unused_language_server_stops_without_a_session() {
+    let (env, log) = fake_ls_env(200);
+    let a = env.client(&["--no-session", "x.fake"]);
+    let pid = wait_for_ls_start(&log, 1);
+
+    a.command("o a.txt");
+    a.command("bc x.fake");
+    wait_for_ls_shutdown(&log, &pid);
+}
+
 // Clipboard
 
 /// With the termcode provider, a copy goes to the terminal of the client that made it, which

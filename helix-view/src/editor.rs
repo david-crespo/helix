@@ -703,6 +703,13 @@ pub struct LspConfig {
     pub snippets: bool,
     /// Whether to include declaration in the goto reference query
     pub goto_reference_include_declaration: bool,
+    /// How long a language server runs with no documents before it's stopped, in
+    /// milliseconds. Zero keeps it running until the editor exits.
+    #[serde(
+        serialize_with = "serialize_duration_millis",
+        deserialize_with = "deserialize_duration_millis"
+    )]
+    pub unused_server_timeout: Duration,
 }
 
 impl Default for LspConfig {
@@ -719,6 +726,7 @@ impl Default for LspConfig {
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,
+            unused_server_timeout: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -2017,6 +2025,15 @@ impl Editor {
         self.config_events.0.send(ConfigEvent::ThemeChanged)?;
 
         Ok(())
+    }
+
+    /// Whether a document has the language server, initialized or not.
+    pub fn language_server_has_documents(&self, language_server_id: LanguageServerId) -> bool {
+        self.documents().any(|doc| {
+            doc.language_servers
+                .values()
+                .any(|ls| ls.id() == language_server_id)
+        })
     }
 
     #[inline]

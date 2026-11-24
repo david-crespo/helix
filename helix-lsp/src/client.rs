@@ -56,7 +56,8 @@ fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
 pub struct Client {
     id: LanguageServerId,
     name: String,
-    _process: Child,
+    /// Killed when the client is dropped.
+    process: tokio::sync::Mutex<Child>,
     server_tx: UnboundedSender<Payload>,
     request_counter: AtomicU64,
     pub(crate) capabilities: OnceCell<lsp::ServerCapabilities>,
@@ -257,7 +258,7 @@ impl Client {
         let client = Self {
             id,
             name,
-            _process: process,
+            process: tokio::sync::Mutex::new(process),
             server_tx,
             request_counter: AtomicU64::new(0),
             capabilities: OnceCell::new(),
@@ -816,6 +817,11 @@ impl Client {
             value: request,
         });
         self.exit();
+    }
+
+    /// Resolves once the server process has exited.
+    pub async fn wait_for_process_exit(&self) {
+        let _ = self.process.lock().await.wait().await;
     }
 
     /// Resolves once the `exit` notification has been written to the server's stdin

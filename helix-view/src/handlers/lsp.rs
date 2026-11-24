@@ -1,6 +1,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::time::Duration;
 
 use crate::editor::Action;
 use crate::events::{
@@ -9,9 +10,10 @@ use crate::events::{
 use crate::{DocumentId, Editor, ViewId};
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::Uri;
-use helix_event::register_hook;
+use helix_event::{register_hook, send_blocking};
 use helix_lsp::util::generate_transaction_from_edits;
 use helix_lsp::{lsp, LanguageServerId, OffsetEncoding};
+use tokio::time::Instant;
 
 use super::Handlers;
 
@@ -38,6 +40,17 @@ pub struct PullDiagnosticsEvent {
 
 pub struct PullAllDocumentsDiagnosticsEvent {
     pub language_servers: HashSet<LanguageServerId>,
+}
+
+pub enum UnusedServersEvent {
+    /// A document closed, leaving these language servers with possibly no documents. Each is
+    /// stopped if it still has none after `timeout`.
+    DocumentClosed {
+        servers: Vec<LanguageServerId>,
+        timeout: Duration,
+    },
+    /// Check again at this time for servers to stop.
+    CheckAt(Instant),
 }
 
 pub struct CodeActionHintEvent {
@@ -388,7 +401,7 @@ impl Editor {
     }
 }
 
-pub fn register_hooks(_handlers: &Handlers) {
+pub fn register_hooks(handlers: &Handlers) {
     register_hook!(move |event: &mut LanguageServerInitialized<'_>| {
         let language_server = event.editor.language_server_by_id(event.server_id).unwrap();
 
@@ -425,10 +438,22 @@ pub fn register_hooks(_handlers: &Handlers) {
         Ok(())
     });
 
+    let tx = handlers.unused_servers.clone();
     register_hook!(move |event: &mut DocumentDidClose<'_>| {
         // Send textDocument/didClose notifications.
         for language_server in event.doc.language_servers() {
             language_server.text_document_did_close(event.doc.identifier());
+        }
+
+        let timeout = event.editor.config().lsp.unused_server_timeout;
+        let servers: Vec<_> = event
+            .doc
+            .language_servers
+            .values()
+            .map(|ls| ls.id())
+            .collect();
+        if !timeout.is_zero() && !servers.is_empty() {
+            send_blocking(&tx, UnusedServersEvent::DocumentClosed { servers, timeout });
         }
 
         Ok(())

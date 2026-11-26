@@ -604,6 +604,19 @@ impl Tree {
         }
     }
 
+    /// The active client's root container.
+    pub fn root(&self) -> ViewId {
+        self.root
+    }
+
+    /// The layout and children of the container `id`, or `None` if `id` is a view.
+    pub fn container(&self, id: ViewId) -> Option<(Layout, &[ViewId])> {
+        match &self.nodes[id].content {
+            Content::Container(container) => Some((container.layout, &container.children)),
+            Content::View(_) => None,
+        }
+    }
+
     pub fn traverse(&self) -> Traverse<'_> {
         Traverse::new(self)
     }

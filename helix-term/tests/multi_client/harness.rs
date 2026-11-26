@@ -6,11 +6,16 @@
 
 use std::{
     fs,
+    fs::File,
     io::{Read, Write},
+    os::fd::BorrowedFd,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Condvar, Mutex},
-    thread,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -213,19 +218,36 @@ impl Env {
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let stopped = Arc::new((Mutex::new(false), Condvar::new()));
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        {
+        let closed = Arc::new(AtomicBool::new(false));
+        // A copy of the terminal's fd of our own, so it stays open for as long as we poll it.
+        let fd = pair.master.as_raw_fd().expect("a pty has an fd");
+        // SAFETY: the master is open until it's dropped, after this.
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned();
+        let mut reader = File::from(fd.expect("dup the pty's fd"));
+        let reader = {
             let parser = parser.clone();
             let output = output.clone();
             let writer = writer.clone();
             let stopped = stopped.clone();
+            let closed = closed.clone();
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut tail = Vec::new();
-                while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 {
-                        break;
+                while !closed.load(Ordering::Relaxed) {
+                    // Poll with a short timeout so we notice when the terminal is closed.
+                    let mut poll = libc::pollfd {
+                        fd: std::os::fd::AsRawFd::as_raw_fd(&reader),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: `poll` is one valid pollfd.
+                    if unsafe { libc::poll(&mut poll, 1, 50) } <= 0 {
+                        continue;
                     }
+                    let n = match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
                     output.lock().unwrap().extend_from_slice(&buf[..n]);
                     let mut parser = parser.lock().unwrap();
                     parser.process(&buf[..n]);
@@ -244,16 +266,18 @@ impl Env {
                     let (stopped, resumed) = &*stopped;
                     drop(resumed.wait_while(stopped.lock().unwrap(), |stopped| *stopped));
                 }
-            });
-        }
+            })
+        };
 
         Client {
             child,
-            master: pair.master,
+            master: Some(pair.master),
             writer,
             parser,
             output,
             stopped,
+            closed,
+            reader: Some(reader),
         }
     }
 }
@@ -296,13 +320,17 @@ fn answer_queries(output: &[u8], screen: &vt100::Screen) -> Vec<u8> {
 
 pub struct Client {
     child: Box<dyn Child + Send + Sync>,
-    master: Box<dyn MasterPty + Send>,
+    /// `None` once the terminal is closed.
+    master: Option<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Everything the terminal received, including what the screen doesn't show.
     output: Arc<Mutex<Vec<u8>>>,
     /// Whether the terminal has stopped reading its program's output, and its resumption.
     stopped: Arc<(Mutex<bool>, Condvar)>,
+    /// Tells the thread that reads the terminal to stop, and close its copy.
+    closed: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl Client {
@@ -378,6 +406,11 @@ impl Client {
         output.windows(bytes.len()).any(|window| window == bytes)
     }
 
+    /// Everything the terminal received.
+    pub fn output(&self) -> Vec<u8> {
+        self.output.lock().unwrap().clone()
+    }
+
     /// The status line, the second row from the bottom.
     pub fn status_line(&self) -> String {
         let (rows, _) = self.parser.lock().unwrap().screen().size();
@@ -446,6 +479,17 @@ impl Client {
         Stalled(self.stopped.clone())
     }
 
+    /// Closes the terminal, as a terminal app that quits does: the program's terminal hangs up,
+    /// and the kernel sends SIGHUP to its foreground process group.
+    pub fn close_terminal(&mut self) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+        *self.writer.lock().unwrap() = Box::new(std::io::sink());
+        self.master = None;
+    }
+
     /// Sends SIGHUP to the client's process group, as closing its terminal would.
     pub fn hang_up(&self) {
         signal("HUP", &format!("-{}", self.pid()));
@@ -463,6 +507,8 @@ impl Client {
             .screen_mut()
             .set_size(nz(rows), nz(cols));
         self.master
+            .as_ref()
+            .expect("an open terminal")
             .resize(PtySize {
                 rows,
                 cols,

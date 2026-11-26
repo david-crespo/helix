@@ -19,6 +19,8 @@ fn setup_logging(verbosity: u64) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Strip OSC7577_TOKEN before starting worker threads or child processes so nothing inherits it.
+    helix_term::resume::take_token();
     let exit_code = main_impl()?;
     std::process::exit(exit_code);
 }
@@ -26,6 +28,19 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn main_impl() -> Result<i32> {
     let mut args = Args::parse_args().context("could not parse arguments")?;
+
+    // Populate startup options from the state file.
+    if let Some(path) = &args.resume {
+        if !helix_term::resume::is_state_file(path) {
+            anyhow::bail!(
+                "--resume must specify a state file that hx wrote, in a directory only you can \
+                 use, not {path:?}"
+            );
+        }
+        if let Some(state) = helix_term::resume::State::load(path) {
+            state.apply(&mut args);
+        }
+    }
 
     helix_loader::initialize_config_file(args.config_file.clone());
     helix_loader::initialize_log_file(args.log_file.clone());
@@ -62,6 +77,8 @@ FLAGS:
     --vsplit                       Split all given files vertically into different windows
     --hsplit                       Split all given files horizontally into different windows
     -w, --working-dir <path>       Specify an initial working directory
+    --resume <file>                Restore an editor from a state file (used by terminals
+                                   supporting OSC 7577)
     -s, --session <name>           Join the editor shared under this name, starting it if needed
     --no-session                   Run a separate editor instead of joining the session
     --remote                       Open the files in the session's last used terminal and exit
@@ -126,6 +143,10 @@ FLAGS:
         eprintln!("Check that it still exists, or pass an initial directory with `--working-dir`");
         return Ok(1);
     }
+    // Absolute, for the state file, since a resumed instance may start in another directory.
+    if let Some(config) = &mut args.config_file {
+        *config = helix_stdx::path::canonicalize(&*config);
+    }
 
     let mut config = match Config::load_default() {
         Ok(config) => config,
@@ -164,7 +185,14 @@ FLAGS:
 
     #[cfg(all(unix, not(feature = "integration")))]
     if let Some(key) = &args.session_server {
-        return helix_term::application::serve(key, config, lang_loader, workspace_trust).await;
+        return helix_term::application::serve(
+            key,
+            args.config_file,
+            config,
+            lang_loader,
+            workspace_trust,
+        )
+        .await;
     }
 
     if let Some(timeout) = args.auto_save {

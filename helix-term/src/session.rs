@@ -20,11 +20,7 @@ use std::{
     mem::MaybeUninit,
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
-        unix::{
-            fs::{DirBuilderExt as _, MetadataExt as _},
-            net::UnixStream,
-            process::CommandExt as _,
-        },
+        unix::{fs::MetadataExt as _, net::UnixStream, process::CommandExt as _},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -45,11 +41,15 @@ use rustix::net::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{args::Args, config::Config};
+use crate::{
+    args::Args,
+    config::Config,
+    resume::{self, Pane},
+};
 
 /// Bumped whenever a message changes shape, so a client never talks to a server it can't
 /// understand.
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 
 /// Tells builds of `hx` apart: the modification time and size of this process's binary, as
 /// they were when this was first called. A server calls it as it starts, since the binary is
@@ -110,10 +110,14 @@ pub struct Hello {
     /// The clipboard provider the client's config gives in its environment: the one it names, or
     /// else the one Helix detects there.
     pub clipboard_provider: ClipboardProvider,
+    /// The state file to keep the client's layout in, so its terminal can bring it back.
+    pub resume: Option<PathBuf>,
+    /// The layout to open with, in place of `files`, from the `--resume` state file.
+    pub layout: Option<resume::Layout>,
 }
 
 impl Hello {
-    fn new(args: &Args, config: &Config, stdin_piped: bool) -> Self {
+    fn new(args: &Args, config: &Config, stdin_piped: bool, resume: Option<&Path>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             build: build_id().to_owned(),
@@ -130,6 +134,8 @@ impl Hello {
                 .collect(),
             stdin_piped,
             clipboard_provider: config.editor.clipboard_provider.clone(),
+            resume: resume.map(Path::to_owned),
+            layout: args.layout.clone(),
         }
     }
 
@@ -156,8 +162,12 @@ pub enum ServerMessage {
     /// Something the user should see, which the client prints to its terminal. Sent while
     /// the server isn't drawing to it: before it's set up, or once it's restored.
     Error(String),
-    /// The client's editor is done. The server has restored the terminal.
+    /// The user quit the client's editor. The server has restored the terminal.
     Exit(i32),
+    /// The client's editor ended without the user quitting it: the server refused the client,
+    /// the server stopped (as on SIGTERM), or the client's terminal went away. Like [`ServerMessage::Exit`],
+    /// except that the client's terminal can still bring it back.
+    Stopped(i32),
 }
 
 pub fn write_message(mut writer: impl Write, message: &impl Serialize) -> io::Result<()> {
@@ -261,18 +271,7 @@ pub fn socket_path(key: &str) -> io::Result<PathBuf> {
         Some(dir) => PathBuf::from(dir).join("helix"),
         None => std::env::temp_dir().join(format!("helix-{uid}")),
     };
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    // Not followed if it's a symlink, which could lead to a directory someone else can write.
-    let meta = std::fs::symlink_metadata(&dir)?;
-    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
-        return Err(io::Error::other(format!(
-            "{} must be a directory that belongs to you and is private (mode 0700)",
-            dir.display()
-        )));
-    }
+    crate::create_private_dir(&dir)?;
     let path = dir.join(format!("{key}.sock"));
     // A socket's path has to fit in `sun_path`, about 100 bytes.
     if rustix::net::SocketAddrUnix::new(&path).is_err() {
@@ -309,11 +308,9 @@ pub fn run_client(key: &str, args: &Args, config: &Config) -> anyhow::Result<i32
 
     // Not `/dev/tty`: on macOS that stands for whatever terminal the process using it controls,
     // and the server controls none.
-    let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
-    let tty = [stdout.as_fd(), stdin.as_fd(), stderr.as_fd()]
-        .into_iter()
-        .find(|fd| rustix::termios::isatty(fd))
-        .context("helix needs a terminal")?;
+    let terminal = crate::terminal().context("helix needs a terminal")?;
+    let tty = terminal.as_fd();
+    let stdin = io::stdin();
     // Restored when the server is done, however it ends, so a crash never leaves the terminal
     // in raw mode.
     let termios = rustix::termios::tcgetattr(tty)?;
@@ -322,8 +319,26 @@ pub fn run_client(key: &str, args: &Args, config: &Config) -> anyhow::Result<i32
     if stdin_piped {
         fds.push(stdin.as_fd());
     }
+    // The client reports, since it's what runs in the pane, and the server keeps the state file
+    // up to date. Until the server first writes it, the file has what starts this instance
+    // again, so it's there as soon as the terminal has the report.
+    let pane = Pane::new(args.resume.as_deref());
+    if let Some(pane) = &pane {
+        let state = resume::State {
+            cwd: helix_stdx::env::current_working_dir(),
+            session: Some(key.to_owned()),
+            config: args.config_file.clone(),
+            auto_save: args.auto_save,
+            layout: args.layout.clone(),
+        };
+        match state.write(pane.path()) {
+            Ok(()) => pane.report(),
+            Err(err) => log::warn!("couldn't write {}: {err}", pane.path().display()),
+        }
+    }
     send_fds(&conn, &fds)?;
-    write_message(&conn, &Hello::new(args, config, stdin_piped))?;
+    let resume = pane.as_ref().map(Pane::path);
+    write_message(&conn, &Hello::new(args, config, stdin_piped, resume))?;
 
     let resized = conn.try_clone()?;
     std::thread::spawn(move || {
@@ -344,10 +359,20 @@ pub fn run_client(key: &str, args: &Args, config: &Config) -> anyhow::Result<i32
                 // `git commit`, stops too and the shell gets the terminal back. This returns
                 // once we're continued, or right away if the group can't be stopped.
                 let _ = rustix::process::kill_current_process_group(rustix::process::Signal::TSTP);
+                if let Some(pane) = &pane {
+                    pane.report();
+                }
                 write_message(&conn, &ClientMessage::Continued)?;
             }
             Ok(ServerMessage::Error(message)) => eprintln!("{message}"),
             Ok(ServerMessage::Exit(code)) => {
+                restore();
+                if let Some(pane) = &pane {
+                    pane.clear();
+                }
+                return Ok(code);
+            }
+            Ok(ServerMessage::Stopped(code)) => {
                 restore();
                 return Ok(code);
             }
@@ -373,11 +398,11 @@ pub fn run_client(key: &str, args: &Args, config: &Config) -> anyhow::Result<i32
 /// say it's done.
 fn run_remote(conn: &UnixStream, args: &Args, config: &Config) -> anyhow::Result<i32> {
     send_fds(conn, &[])?;
-    write_message(conn, &Hello::new(args, config, false))?;
+    write_message(conn, &Hello::new(args, config, false, None))?;
     loop {
         match read_message(conn).context("the helix session server went away")? {
             ServerMessage::Error(message) => eprintln!("{message}"),
-            ServerMessage::Exit(code) => return Ok(code),
+            ServerMessage::Exit(code) | ServerMessage::Stopped(code) => return Ok(code),
             ServerMessage::Suspend => {}
         }
     }

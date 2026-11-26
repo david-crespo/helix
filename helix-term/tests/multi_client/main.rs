@@ -15,6 +15,7 @@
 compile_error!("`integration` swaps the terminal for a test backend; run these tests without it");
 
 mod harness;
+mod resume;
 #[cfg(feature = "steel")]
 mod steel;
 

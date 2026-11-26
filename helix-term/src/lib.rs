@@ -11,6 +11,7 @@ pub mod health;
 pub mod job;
 pub mod keymap;
 pub mod logging;
+pub mod resume;
 #[cfg(unix)]
 pub mod session;
 pub mod ui;
@@ -22,6 +23,38 @@ mod handlers;
 
 use helix_stdx::Url;
 use ignore::DirEntry;
+
+/// This process's terminal: the first of stdout, stdin, and stderr that is a terminal. A
+/// duplicate, so it can outlive the handle it came from.
+#[cfg(unix)]
+pub fn terminal() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd as _;
+    let (stdin, stdout, stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    let fds = [stdout.as_fd(), stdin.as_fd(), stderr.as_fd()];
+    let tty = fds.into_iter().find(|fd| rustix::termios::isatty(fd))?;
+    tty.try_clone_to_owned().ok()
+}
+
+/// Creates `dir` if it's missing, and checks that it's a directory, not a symlink, that belongs
+/// to this user and has mode 0700.
+#[cfg(unix)]
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // Not followed if it's a symlink, which could lead to a directory someone else can write.
+    let meta = std::fs::symlink_metadata(dir)?;
+    let uid = rustix::process::getuid().as_raw();
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(format!(
+            "{} must be a directory that belongs to you and is private (mode 0700)",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
 
 #[cfg(windows)]
 fn true_color() -> bool {

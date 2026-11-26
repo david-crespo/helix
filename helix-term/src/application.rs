@@ -28,6 +28,7 @@ use crate::{
     handlers,
     job::{self, Jobs},
     keymap::Keymaps,
+    resume,
     ui::{self, overlay::overlaid},
 };
 
@@ -105,6 +106,10 @@ pub struct Application {
     focused: ClientId,
     /// Set when this process is a session server, sharing the editor between terminals.
     server: Option<server::Server>,
+    /// The pane this editor runs in on its own, if its terminal can bring it back. A session's
+    /// clients have their own.
+    pane: Option<resume::Pane>,
+    state_files: resume::StateFiles,
 }
 
 struct ClientUi {
@@ -146,7 +151,17 @@ impl Application {
         let mut stdin = stdin();
         let piped = !stdin.is_terminal() && !cfg!(feature = "integration");
         let stdin = piped.then_some(&mut stdin as &mut dyn Read);
-        Self::with_backend(args, config, lang_loader, workspace_trust, backend, stdin)
+        let pane = resume::Pane::new(args.resume.as_deref());
+        let (config_file, auto_save) = (args.config_file.clone(), args.auto_save);
+        let mut app =
+            Self::with_backend(args, config, lang_loader, workspace_trust, backend, stdin)?;
+        if let Some(pane) = &pane {
+            app.state_files = resume::StateFiles::new(None, config_file);
+            let path = pane.path().to_owned();
+            app.state_files.add(ClientId::default(), path, auto_save);
+        }
+        app.pane = pane;
+        Ok(app)
     }
 
     /// Starts the editor with one client, on `backend`'s terminal. `stdin` is what was piped to
@@ -215,6 +230,7 @@ impl Application {
             signal::SIGUSR1,
             signal::SIGTERM,
             signal::SIGINT,
+            signal::SIGHUP,
         ])
         .context("build signal handler")?;
 
@@ -231,6 +247,8 @@ impl Application {
             active: ClientId::default(),
             focused: ClientId::default(),
             server: None,
+            pane: None,
+            state_files: resume::StateFiles::new(None, None),
         };
 
         Ok(app)
@@ -246,7 +264,9 @@ impl Application {
     ) -> Result<(), Error> {
         use helix_view::editor::Action;
 
-        if args.load_tutor {
+        if let Some(layout) = args.layout {
+            layout.restore(editor);
+        } else if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
             editor.open(&path, Action::VerticalSplit)?;
             // Unset path to prevent accidentally saving to the original tutor file.
@@ -438,6 +458,13 @@ impl Application {
         // scheduled.
         self.editor.needs_redraw = false;
         self.for_each_client(Self::render_client);
+        self.state_files.schedule();
+    }
+
+    /// Writes the state file of every client whose state changed.
+    fn save_layouts(&mut self) {
+        self.state_files.cancel();
+        self.for_each_client(|app| app.state_files.save(&app.editor));
     }
 
     fn render_client(&mut self) {
@@ -511,8 +538,15 @@ impl Application {
                     };
                 }
                 Some(event) = input_stream.next() => {
+                    // The terminal went away, perhaps before SIGHUP arrived. Stop as on
+                    // SIGHUP. In a session, input from a client's terminal arrives as a server
+                    // event instead.
+                    if event.is_err() {
+                        return false;
+                    }
                     self.handle_terminal_events(ClientId::default(), event).await;
                 }
+                () = self.state_files.due() => self.save_layouts(),
                 event = server::next_event(&mut self.server) => {
                     if !self.handle_server_event(event).await {
                         return false;
@@ -792,6 +826,9 @@ impl Application {
                 }
             }
             signal::SIGCONT => {
+                if let Some(pane) = &self.pane {
+                    pane.report();
+                }
                 if let Err(err) = self.reclaim_terminal() {
                     panic!("Failed to claim terminal: {}", err);
                 }
@@ -802,9 +839,13 @@ impl Application {
                 self.render().await;
             }
             signal::SIGTERM | signal::SIGINT => {
-                self.restore_term().unwrap();
+                // Its terminal may be gone already.
+                let _ = self.restore_term();
                 return false;
             }
+            // The terminal is gone, so there's none to restore. Exiting the event loop cleanly
+            // lets us save the latest layouts before quitting.
+            signal::SIGHUP => return false,
             _ => unreachable!(),
         }
 
@@ -982,6 +1023,7 @@ impl Application {
         let is_input = true;
         if is_input {
             self.focused = client;
+            self.state_files.postpone();
         }
         self.activate(client);
 
@@ -1662,15 +1704,31 @@ impl Application {
     where
         S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
     {
+        // The state file first, so it's there by the time the terminal has the report.
+        self.save_layouts();
+        if let Some(pane) = &self.pane {
+            pane.report();
+        }
         self.terminal.claim()?;
 
         self.event_loop(input_stream).await;
+
+        // Quitting closes every view. Whatever else ended the editor, like a signal, leaves the
+        // layout for the terminal to bring back.
+        let quit = self.editor.tree.is_empty();
+        if !quit {
+            self.save_layouts();
+        }
 
         let close_errs = self.close().await;
 
         ScriptingEngine::shutdown();
 
-        self.restore_term()?;
+        let restored = self.restore_term();
+        if let Some(pane) = self.pane.as_ref().filter(|_| quit) {
+            pane.clear();
+        }
+        restored?;
 
         for err in close_errs {
             self.editor.exit_code = 1;

@@ -4,6 +4,8 @@ use helix_view::tree::Layout;
 use indexmap::IndexMap;
 use std::path::PathBuf;
 
+use crate::resume;
+
 #[derive(Default)]
 pub struct Args {
     pub display_help: bool,
@@ -32,6 +34,10 @@ pub struct Args {
     /// Save this client's buffers this many milliseconds after an edit, and when its terminal
     /// loses focus.
     pub auto_save: Option<u64>,
+    /// The state file of the instance to bring back. See [`crate::resume`].
+    pub resume: Option<PathBuf>,
+    /// The layout to open with, in place of `files`: the one in `resume`'s state file.
+    pub layout: Option<resume::Layout>,
 }
 
 impl Args {
@@ -101,6 +107,10 @@ impl Args {
                 "--auto-save" => match argv.next().map(|ms| ms.parse()) {
                     Some(Ok(ms)) => args.auto_save = Some(ms),
                     _ => anyhow::bail!("--auto-save must specify a delay in milliseconds"),
+                },
+                "--resume" => match argv.next() {
+                    Some(path) => args.resume = Some(helix_stdx::path::canonicalize(path)),
+                    None => anyhow::bail!("--resume must specify a state file"),
                 },
                 "--session-server" => match argv.next() {
                     Some(key) => args.session_server = Some(key),

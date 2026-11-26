@@ -40,7 +40,7 @@ use crate::{
     compositor::Compositor,
     config::Config,
     events::{ClientAttached, ClientDetached},
-    handlers,
+    handlers, resume,
     session::{self, ClientMessage, Hello, ServerMessage},
 };
 
@@ -154,6 +154,7 @@ pub async fn next_event(server: &mut Option<Server>) -> ServerEvent {
 /// for this process.
 pub async fn serve(
     key: &str,
+    config_file: Option<PathBuf>,
     config: Config,
     lang_loader: syntax::Loader,
     workspace_trust: helix_loader::workspace_trust::WorkspaceTrust,
@@ -221,12 +222,14 @@ pub async fn serve(
             backend,
             stdin.as_mut().map(|stdin| stdin as &mut dyn Read),
         )?;
-        app.editor.registers.client_clipboard = Some(client.hello.clipboard_provider);
+        app.editor.registers.client_clipboard = Some(client.hello.clipboard_provider.clone());
         if let Some(delay) = auto_save {
             app.editor
                 .client_auto_save
                 .insert(ClientId::default(), delay);
         }
+        app.state_files = resume::StateFiles::new(Some(key.to_owned()), config_file);
+        app.keep_state(&client.hello);
         Ok(app)
     })();
     let mut app = match app {
@@ -261,6 +264,8 @@ pub async fn serve(
     }
 
     app.event_loop(&mut stream::pending()).await;
+    // For the clients still open, whose terminals can bring them back.
+    app.save_layouts();
 
     // Stop taking new clients first, so they start a new server rather than join this one as
     // it shuts down.
@@ -274,16 +279,12 @@ pub async fn serve(
     drop((socket, listener));
     let errors = app.close().await;
     ScriptingEngine::shutdown();
-    let exit = |code| {
+    let exit = |end: fn(i32) -> ServerMessage, code| {
         let mut messages: Vec<_> = errors
             .iter()
             .map(|err| ServerMessage::Error(format!("Error: {err}")))
             .collect();
-        messages.push(ServerMessage::Exit(if errors.is_empty() {
-            code
-        } else {
-            1
-        }));
+        messages.push(end(if errors.is_empty() { code } else { 1 }));
         messages
     };
     let mut closing = Vec::new();
@@ -295,12 +296,12 @@ pub async fn serve(
             wait.code = code;
         }
         if let Some(conn) = conns.remove(&client) {
-            conn.send_after(&mut app.terminal, exit(code));
+            conn.send_after(&mut app.terminal, exit(end(&app.editor), code));
             closing.push(conn);
         }
     }
     for wait in waits {
-        exit(wait.code)
+        exit(ServerMessage::Exit, wait.code)
             .into_iter()
             .for_each(|message| wait.conn.send(message));
         closing.push(wait.conn);
@@ -377,6 +378,7 @@ fn args(hello: &Hello) -> Args {
         files: hello.files.clone(),
         split: hello.split,
         load_tutor: hello.load_tutor,
+        layout: hello.layout.clone(),
         ..Args::default()
     }
 }
@@ -430,11 +432,20 @@ fn reload_if_changed(editor: &mut Editor, path: &Path) {
     }
 }
 
+/// Returns `Exit` if the user quit (closing all views), or `Stopped` if the editor ended
+/// another way (e.g. signal or lost terminal) so the terminal can still resume it.
+fn end(editor: &Editor) -> fn(i32) -> ServerMessage {
+    match editor.tree.is_empty() {
+        true => ServerMessage::Exit,
+        false => ServerMessage::Stopped,
+    }
+}
+
 /// Tells a client it can't join.
 fn refuse(conn: &Conn, err: &anyhow::Error) {
     log::warn!("a client couldn't attach: {err:#}");
     conn.send(ServerMessage::Error(format!("{err:#}")));
-    conn.send(ServerMessage::Exit(1));
+    conn.send(ServerMessage::Stopped(1));
 }
 
 impl Server {
@@ -624,7 +635,22 @@ impl Application {
             );
         }
         self.terminal.claim()?;
+        self.keep_state(hello);
         Ok(())
+    }
+
+    /// Registers the active client's resume state file and writes its initial state.
+    fn keep_state(&mut self, hello: &Hello) {
+        let Some(path) = &hello.resume else {
+            return;
+        };
+        if !resume::is_state_file(path) {
+            log::warn!("not keeping a client's state in {}", path.display());
+            return;
+        }
+        self.state_files
+            .add(self.active, path.clone(), hello.auto_save);
+        self.state_files.save(&self.editor);
     }
 
     /// Suspends the clients that asked to be, and detaches those that have closed all their
@@ -711,6 +737,11 @@ impl Application {
     /// Detaches a client whose terminal or connection went away. Its edits stay, for the other
     /// clients to find.
     fn lose(&mut self, client: ClientId) -> bool {
+        // Save the client's final layout before detaching so its terminal can resume it.
+        if self.activate(client) {
+            self.state_files.save(&self.editor);
+        }
+        self.activate(self.focused);
         if !self.detach(client) {
             return false;
         }
@@ -759,13 +790,14 @@ impl Application {
         }
         let _ = self.restore_term();
         if let Some(conn) = conn {
-            conn.send_after(&mut self.terminal, vec![ServerMessage::Exit(code)]);
+            conn.send_after(&mut self.terminal, vec![end(&self.editor)(code)]);
         }
         if self.focused == client {
             self.focused = next;
         }
         self.activate(self.focused);
         self.editor.remove_client(client);
+        self.state_files.remove(client);
         helix_event::dispatch(ClientDetached {
             editor: &mut self.editor,
             client,

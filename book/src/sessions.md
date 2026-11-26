@@ -114,3 +114,48 @@ as they would be without sessions.
 
 Configuration, including `.helix/config.toml` in the workspace, is read when
 the server starts and applies to every terminal.
+
+## Resuming after the terminal restarts
+
+A terminal that supports the
+[Program Resume Protocol](https://www.superlogical.com/rex/docs/build/program-resume.md),
+such as Rex, can start `hx` again in the same pane after the terminal itself
+restarts. This works with and without sessions. Each `hx` reports
+`hx --resume <file>` to its terminal as the command that brings it back. The
+file is in `~/.local/state/helix/resume`, or in `$XDG_STATE_HOME/helix/resume`
+if that's set. Helix only uses that directory if it belongs to you and no one
+else has access to it. Each state file stores:
+
+- the editor's working directory, its session, the `--config` path, and the
+  `--auto-save` delay,
+- its splits, with the file, selections, and scroll position of each view,
+  and which view has focus, and
+- open buffers not shown in any view.
+
+Unsaved changes aren't kept. A view of a scratch buffer comes back empty.
+Positions are kept as lines and columns, and clamped to the end of a file
+that got shorter in the meantime.
+
+Helix writes the state file when `hx` starts. After that, it writes it again
+after three seconds without input if the state has changed. With sessions,
+the session's server writes the file for each terminal. When the terminal
+disconnects (for example, during a restart), Helix saves that terminal's
+state one last time and leaves the file for the new `hx` to read. Quitting
+`hx` deletes the file and clears the command from the terminal. State files
+that are more than 30 days old are deleted.
+
+The terminal shares a secret with each pane through the `OSC7577_TOKEN`
+environment variable. Helix removes it from its environment as it starts, so
+child processes (language servers, shell commands, and the session server)
+don't inherit it. Without it, Helix reports nothing and writes no state files.
+
+In Rex, allow the command in `init.lua`:
+
+```lua
+rex.set("resume.trust.hx", {
+  command = { "hx", "--resume", rex.match.under("~/.local/state/helix/resume") },
+})
+```
+
+`hx` must be on the `PATH` of the shell that Rex starts the command in. If you
+set `XDG_STATE_HOME`, use its `helix/resume` directory in the rule instead.

@@ -139,6 +139,13 @@ pub fn data_dir() -> PathBuf {
     path
 }
 
+/// Where Helix keeps state that outlasts a run, `$XDG_STATE_HOME/helix`. `None` where the platform
+/// has no such directory, as on Windows.
+pub fn state_dir() -> Option<PathBuf> {
+    let strategy = choose_base_strategy().ok()?;
+    Some(strategy.state_dir()?.join("helix"))
+}
+
 pub fn config_file() -> PathBuf {
     CONFIG_FILE.get().map(|path| path.to_path_buf()).unwrap()
 }
